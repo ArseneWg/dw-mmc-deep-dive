@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>06. 调试与读代码方法 - dw_mmc.c 从 0 吃透</title>
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">dw_mmc.c 从 0 吃透</div>
+      <div class="subtitle">DesignWare MMC host driver deep dive</div>
+      <nav class="nav">
+<a href="index.html" class="">阅读路线</a>
+<a href="00_mental_model.html" class="">00. 先建立心智模型</a>
+<a href="01_probe_and_host_registration.html" class="">01. probe 与 host 注册</a>
+<a href="02_request_lifecycle.html" class="">02. 一个 request 的生命周期</a>
+<a href="03_data_path_dma_pio.html" class="">03. 数据路径：DMA、PIO 与 FIFO</a>
+<a href="04_interrupts_timers_tasklet.html" class="">04. IRQ/timer/tasklet 状态机</a>
+<a href="05_power_clock_voltage_sdio_pm.html" class="">05. 时钟、电源、CMD11 与 SDIO IRQ</a>
+<a href="06_reading_and_debugging.html" class="active">06. 调试与读代码方法</a>
+      </nav>
+    </aside>
+    <main class="content-wrap">
+      <article class="content">
+<h1 id="06-调试与读代码方法">06. 调试与读代码方法</h1>
+<p>这一篇给实际排障用。目标不是列所有寄存器，而是帮助你把现象快速映射到
+<code>dw_mmc.c</code> 的几条路径：request 入口、事件生产者、tasklet
+消费者、数据路径、clock/power 路径。</p>
+<p><img src="assets/debug_map.svg" alt="调试地图" /></p>
+<h2 id="1-debugfs-能直接看到的东西">1. debugfs 能直接看到的东西</h2>
+<p>如果内核启用了
+<code>CONFIG_DEBUG_FS</code>，<code>dw_mci_init_debugfs()</code>
+会创建调试节点，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:193</code>。</p>
+<table>
+<thead>
+<tr class="header">
+<th>节点</th>
+<th style="text-align: right;">创建位置</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>regs</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:203</code></td>
+<td>读 <code>STATUS/RINTSTS/CMD/CTRL/INTMASK/CLKENA</code></td>
+</tr>
+<tr class="even">
+<td><code>req</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:204</code></td>
+<td>打印当前 request 的 cmd/data/stop/error/bytes</td>
+</tr>
+<tr class="odd">
+<td><code>state</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:205</code></td>
+<td>当前 tasklet 状态机状态值</td>
+</tr>
+<tr class="even">
+<td><code>pending_events</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:206</code></td>
+<td>IRQ/timer 已投递、tasklet 待消费的事件位</td>
+</tr>
+<tr class="odd">
+<td><code>completed_events</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:208</code></td>
+<td>tasklet 已消费的事件位</td>
+</tr>
+<tr class="even">
+<td><code>fail_data_crc</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:210</code></td>
+<td>fault injection 场景下可注入 data CRC 错误</td>
+</tr>
+</tbody>
+</table>
+<p>状态值按 <code>enum dw_mci_state</code> 解码，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.h:21</code>。事件 bit 按
+<code>EVENT_CMD_COMPLETE = 0</code>、<code>EVENT_XFER_COMPLETE = 1</code>、<code>EVENT_DATA_COMPLETE = 2</code>、<code>EVENT_DATA_ERROR = 3</code>
+解码，定义在 <code>kernel/drivers/mmc/host/dw_mmc.h:32</code>。</p>
+<h2 id="2-先判断卡在哪一层">2. 先判断卡在哪一层</h2>
+<table>
+<thead>
+<tr class="header">
+<th>现象</th>
+<th>优先看</th>
+<th>可能位置</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>request 没开始</td>
+<td><code>state</code> 是否 <code>IDLE</code>，<code>req</code>
+是否为空，card detect</td>
+<td><code>dw_mci_request()</code>、<code>dw_mci_queue_request()</code></td>
+</tr>
+<tr class="even">
+<td>命令不完成</td>
+<td><code>pending_events</code> 是否缺 bit0，<code>regs</code> 的
+<code>RINTSTS/CMD/INTMASK</code></td>
+<td><code>dw_mci_cmd_interrupt()</code>、<code>cto_timer</code>、clock</td>
+</tr>
+<tr class="odd">
+<td>数据搬不完</td>
+<td>bit1 是否缺失，DMA/PIO 模式</td>
+<td>DMA callback、PIO RXDR/TXDR</td>
+</tr>
+<tr class="even">
+<td>data over 不来</td>
+<td>bit2 是否缺失，<code>RINTSTS</code> 是否有 DATA_OVER/DRTO</td>
+<td><code>dw_mci_interrupt()</code>、<code>dto_timer</code></td>
+</tr>
+<tr class="odd">
+<td>一直 data error</td>
+<td>bit3、<code>data_status</code>、DCRC/DRTO/EBE/SBE</td>
+<td><code>dw_mci_data_complete()</code>、reset、FIFO/DMA</td>
+</tr>
+<tr class="even">
+<td>CMD11 后不再接新请求</td>
+<td><code>state</code> 是否 <code>WAITING_CMD11_DONE</code>，后续
+<code>set_ios()</code> 是否有 clock 非 0</td>
+<td>CMD11 + <code>setup_bus()</code> + <code>set_ios()</code></td>
+</tr>
+<tr class="odd">
+<td>SDIO IRQ 丢</td>
+<td><code>CLKENA</code> low power bit、SDIO INTMASK、runtime PM</td>
+<td><code>dw_mci_prepare_sdio_irq()</code>、<code>dw_mci_enable_sdio_irq()</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="3-看日志加-trace-时的推荐锚点">3. 看日志/加 trace
+时的推荐锚点</h2>
+<p>如果要临时加日志，优先加在“边界点”，不要在每个分支里撒日志：</p>
+<table>
+<thead>
+<tr class="header">
+<th>锚点</th>
+<th style="text-align: right;">代码位置</th>
+<th>建议记录</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>请求进入</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1469</code></td>
+<td>opcode、data blocks/blksz、state、queue 是否空</td>
+</tr>
+<tr class="even">
+<td>请求启动</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1363</code></td>
+<td><code>cmd-&gt;opcode</code>、是否 <code>sbc</code>、是否
+data、<code>cmdflags</code></td>
+</tr>
+<tr class="odd">
+<td>命令完成事件</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2920</code></td>
+<td>pending status、<code>cmd_status</code>、state</td>
+</tr>
+<tr class="even">
+<td>data error/data over</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2983</code>
+/ <code>kernel/drivers/mmc/host/dw_mmc.c:3005</code></td>
+<td><code>data_status</code>、dir、DMA/PIO</td>
+</tr>
+<tr class="odd">
+<td>tasklet 状态迁移</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2171</code></td>
+<td>old state、new state、pending/completed events</td>
+</tr>
+<tr class="even">
+<td>请求结束</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1967</code></td>
+<td>cmd/data/stop error、bytes、next queue</td>
+</tr>
+<tr class="odd">
+<td>clock 配置</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1250</code></td>
+<td>requested clock、div、actual_clock、CLKENA</td>
+</tr>
+</tbody>
+</table>
+<p>如果日志太多，先只加 request start、IRQ event、tasklet state、request
+end 四处。这样能还原一次请求的闭环。</p>
+<h2 id="4-错误码从哪里来">4. 错误码从哪里来</h2>
+<p>命令错误在 <code>dw_mci_command_complete()</code> 里映射，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2004</code>：</p>
+<ul>
+<li><code>SDMMC_INT_RTO</code> -&gt; <code>-ETIMEDOUT</code></li>
+<li>response CRC 错 -&gt; <code>-EILSEQ</code></li>
+<li>response error -&gt; <code>-EIO</code></li>
+</ul>
+<p>数据错误在 <code>dw_mci_data_complete()</code> 里映射，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2037</code>：</p>
+<ul>
+<li><code>SDMMC_INT_DRTO</code> -&gt; <code>-ETIMEDOUT</code></li>
+<li><code>SDMMC_INT_DCRC</code> -&gt; <code>-EILSEQ</code></li>
+<li><code>SDMMC_INT_EBE</code> 按读/写方向分别处理</li>
+<li>其他包含 SBE 的错误 -&gt; <code>-EILSEQ</code></li>
+</ul>
+<p>如果上层只看到 <code>-EILSEQ</code> 或
+<code>-ETIMEDOUT</code>，需要回到底层
+<code>cmd_status/data_status</code> 才能知道是 RCRC、DCRC、DRTO、EBE
+还是 SBE。</p>
+<h2 id="5-一次正常读请求的核对清单">5. 一次正常读请求的核对清单</h2>
+<ol type="1">
+<li><code>dw_mci_request()</code> 被调用，card present。</li>
+<li><code>dw_mci_queue_request()</code> 从 <code>IDLE</code> 转
+<code>SENDING_CMD</code>。</li>
+<li><code>__dw_mci_start_request()</code> 设置 BYTCNT/BLKSIZ，准备
+DMA/PIO，发命令。</li>
+<li>IRQ 设置 <code>EVENT_CMD_COMPLETE</code>，tasklet 完成
+command。</li>
+<li>DMA callback 或 PIO 函数设置 <code>EVENT_XFER_COMPLETE</code>。</li>
+<li>DATA_OVER IRQ 设置 <code>EVENT_DATA_COMPLETE</code>。</li>
+<li>tasklet 调 <code>dw_mci_data_complete()</code>，无错则
+<code>request_end()</code>。</li>
+<li><code>mmc_request_done()</code> 被调用，队列为空则回
+<code>IDLE</code>。</li>
+</ol>
+<p>这 8 步任何一步断了，都能在
+<code>state/pending_events/completed_events/regs/req</code>
+中找到对应缺口。</p>
+<h2 id="6-文章质量边界">6. 文章质量边界</h2>
+<p>这套文章的自检目标是文档质量，不替代内核运行验证。发布前检查过：Markdown
+文件齐全，SVG 引用存在且非空，文中
+<code>kernel/drivers/mmc/host/dw_mmc.c:行号</code> 和
+<code>dw_mmc.h:行号</code> 都在当前源码范围内，且没有占位符残留。</p>
+<p>真正要验证驱动行为，还需要结合目标板日志、debugfs
+和实际读写/枚举测试。</p>
+
+        <div class="footer">Generated as a static GitHub Pages site from the Markdown source in this repository.</div>
+      </article>
+    </main>
+  </div>
+</body>
+</html>

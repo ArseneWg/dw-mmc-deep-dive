@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>00. 先建立心智模型 - dw_mmc.c 从 0 吃透</title>
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">dw_mmc.c 从 0 吃透</div>
+      <div class="subtitle">DesignWare MMC host driver deep dive</div>
+      <nav class="nav">
+<a href="index.html" class="">阅读路线</a>
+<a href="00_mental_model.html" class="active">00. 先建立心智模型</a>
+<a href="01_probe_and_host_registration.html" class="">01. probe 与 host 注册</a>
+<a href="02_request_lifecycle.html" class="">02. 一个 request 的生命周期</a>
+<a href="03_data_path_dma_pio.html" class="">03. 数据路径：DMA、PIO 与 FIFO</a>
+<a href="04_interrupts_timers_tasklet.html" class="">04. IRQ/timer/tasklet 状态机</a>
+<a href="05_power_clock_voltage_sdio_pm.html" class="">05. 时钟、电源、CMD11 与 SDIO IRQ</a>
+<a href="06_reading_and_debugging.html" class="">06. 调试与读代码方法</a>
+      </nav>
+    </aside>
+    <main class="content-wrap">
+      <article class="content">
+<h1 id="00-先建立心智模型">00. 先建立心智模型</h1>
+<p>读 <code>dw_mmc.c</code> 最大的坑，是一上来就把注意力放到
+<code>dw_mci_tasklet_func()</code>。这个函数确实是核心状态机，但它不是整个驱动的入口，也不是事件的来源。更好的读法是先把文件分成四层：MMC
+core 接口层、请求生命周期层、事件/状态机层、硬件服务层。</p>
+<p><img src="assets/architecture.svg" alt="整体架构" /></p>
+<h2 id="1-这个驱动在-mmc-栈里的位置">1. 这个驱动在 MMC 栈里的位置</h2>
+<p>Linux MMC core 管卡的枚举、块设备、SDIO
+function、调度和公共协议；host driver 负责把 core 发来的
+<code>mmc_request</code> 转成控制器寄存器操作。<code>dw_mmc.c</code>
+就是 Synopsys DesignWare MMC 控制器的 host driver 核心。</p>
+<p>真正暴露给 MMC core 的入口集中在
+<code>dw_mci_ops</code>：<code>request</code>
+进入请求路径，<code>pre_req/post_req</code> 配合 DMA
+映射，<code>set_ios</code>
+配置电源/时钟/总线宽度，<code>start_signal_voltage_switch</code>
+处理信号电压切换，<code>enable_sdio_irq/ack_sdio_irq</code> 处理 SDIO
+中断。这张表在 <code>kernel/drivers/mmc/host/dw_mmc.c:1884</code>
+开始。</p>
+<p>这意味着：如果你想知道“MMC core 怎么调用 dw_mmc”，先看
+<code>dw_mci_ops</code>；如果你想知道“设备怎么注册成一个 MMC host”，先看
+<code>dw_mci_probe()</code> 和
+<code>dw_mci_init_slot()</code>；如果你想知道“一次读写怎么跑完”，再看
+<code>dw_mci_request()</code> 和 tasklet。</p>
+<h2 id="2-三个对象hostslotrequest">2. 三个对象：host、slot、request</h2>
+<p><code>struct dw_mci</code> 是控制器级别状态。它保存寄存器地址、DMA
+能力、当前请求、当前命令、当前数据、tasklet、事件位、状态机状态和等待队列。定义和注释在
+<code>kernel/drivers/mmc/host/dw_mmc.h:58</code>，其中
+<code>pending_events</code>、<code>completed_events</code>、<code>state</code>
+的角色写得很清楚，字段本身在
+<code>kernel/drivers/mmc/host/dw_mmc.h:197</code> 到
+<code>kernel/drivers/mmc/host/dw_mmc.h:200</code>。</p>
+<p><code>struct dw_mci_slot</code>
+是卡槽级别状态。这个驱动当前主要按一个 slot 使用，slot 内部挂着
+<code>struct mmc_host</code>，<code>mmc_priv(mmc)</code> 取回的就是
+slot。</p>
+<p><code>struct mmc_request</code> 是一次来自 core 的事务。它可能有
+<code>sbc</code>、<code>cmd</code>、<code>data</code>、<code>stop</code>。读写块设备时通常是命令加数据，某些多块传输还会带
+stop。<code>dw_mmc.c</code> 的请求路径就是围绕这四件东西做编排。</p>
+<h2 id="3-文件里真正有几类状态">3. 文件里真正有几类“状态”</h2>
+<p>头文件里有一个显式状态机：<code>enum dw_mci_state</code>，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.h:21</code>。状态包括：</p>
+<table>
+<thead>
+<tr class="header">
+<th>状态</th>
+<th>人话解释</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>STATE_IDLE</code></td>
+<td>控制器空闲，可以立刻启动新请求</td>
+</tr>
+<tr class="even">
+<td><code>STATE_SENDING_CMD</code></td>
+<td>命令已经写入控制器，等待命令完成事件</td>
+</tr>
+<tr class="odd">
+<td><code>STATE_SENDING_DATA</code></td>
+<td>命令已完成，数据正在从 DMA/PIO/FIFO 侧搬运</td>
+</tr>
+<tr class="even">
+<td><code>STATE_DATA_BUSY</code></td>
+<td>内存侧数据搬完，等待卡/控制器侧 data over</td>
+</tr>
+<tr class="odd">
+<td><code>STATE_SENDING_STOP</code></td>
+<td>stop/abort 命令已经发出，等待 stop 命令完成</td>
+</tr>
+<tr class="even">
+<td><code>STATE_DATA_ERROR</code></td>
+<td>数据错误后进入过渡状态，等 transfer complete 后回到 data busy
+收尾</td>
+</tr>
+<tr class="odd">
+<td><code>STATE_SENDING_CMD11</code></td>
+<td>SD voltage switch 的 CMD11 特殊命令正在发送</td>
+</tr>
+<tr class="even">
+<td><code>STATE_WAITING_CMD11_DONE</code></td>
+<td>CMD11 命令完成，但电压切换/clock 更新还没完全收尾</td>
+</tr>
+</tbody>
+</table>
+<p>还有一个隐式事件机：<code>EVENT_CMD_COMPLETE</code>、<code>EVENT_XFER_COMPLETE</code>、<code>EVENT_DATA_COMPLETE</code>、<code>EVENT_DATA_ERROR</code>，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.h:32</code>。事件不是状态，事件是
+IRQ/timer/DMA/PIO 交给 tasklet 的“信号”。</p>
+<p>所以这份代码至少要分两张表理解：状态表回答“现在卡在哪一步”，事件表回答“下一步靠什么信号触发”。把两者强行画成一张大图，读者会被交叉箭头淹没。</p>
+<h2 id="4-两条主线控制线和数据线">4. 两条主线：控制线和数据线</h2>
+<p>控制线是命令：<code>dw_mci_prepare_command()</code> 组 CMDR
+bits，<code>dw_mci_start_command()</code> 写 CMDARG/CMD 并启动响应
+timeout，命令完成由 IRQ 或 timer 设置
+<code>EVENT_CMD_COMPLETE</code>。对应代码在
+<code>kernel/drivers/mmc/host/dw_mmc.c:283</code>、<code>kernel/drivers/mmc/host/dw_mmc.c:428</code>、<code>kernel/drivers/mmc/host/dw_mmc.c:2920</code>。</p>
+<p>数据线是搬运：有 data 的命令会先写 BYTCNT/BLKSIZ，然后
+<code>dw_mci_submit_data()</code> 决定 DMA 还是 PIO，最后由 DMA callback
+或 PIO 读写函数设置 <code>EVENT_XFER_COMPLETE</code>。卡侧 data over
+则由主 IRQ 设置 <code>EVENT_DATA_COMPLETE</code>。对应代码在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1384</code>、<code>kernel/drivers/mmc/host/dw_mmc.c:1187</code>、<code>kernel/drivers/mmc/host/dw_mmc.c:510</code>、<code>kernel/drivers/mmc/host/dw_mmc.c:2810</code>、<code>kernel/drivers/mmc/host/dw_mmc.c:3005</code>。</p>
+<p>一句话总结：命令线决定“能不能开始”，数据线决定“内存侧搬没搬完”，data
+over 决定“卡侧事务是否真正结束”。</p>
+<h2 id="5-推荐阅读顺序">5. 推荐阅读顺序</h2>
+<p>第一遍只看大路径：<code>dw_mci_probe()</code> 注册
+host，<code>dw_mci_ops</code> 暴露入口，<code>dw_mci_request()</code>
+接收请求，<code>__dw_mci_start_request()</code>
+启动命令/数据，<code>dw_mci_interrupt()</code>
+产生事件，<code>dw_mci_tasklet_func()</code>
+消费事件，<code>dw_mci_request_end()</code> 回调 MMC core。</p>
+<p>第二遍再看分支：DMA/PIO、CMD11、SDIO IRQ、runtime PM、timeout
+timer、错误恢复。</p>
+<p>第三遍才需要对照寄存器细节，例如
+<code>CLKENA/CLKDIV/CTYPE/TMOUT/FIFOTH/INTMASK/RINTSTS/MINTSTS</code>。</p>
+
+        <div class="footer">Generated as a static GitHub Pages site from the Markdown source in this repository.</div>
+      </article>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,15 @@
+digraph G {
+  graph [rankdir=LR, bgcolor="white", pad="0.2", nodesep="0.50", ranksep="0.70", splines=ortho];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC, Arial", fontsize=14, margin="0.16,0.10", color="#cbd5e1", fillcolor="#f8fafc"];
+  edge [fontname="Noto Sans CJK SC, Arial", fontsize=12, color="#475569", arrowsize=0.8];
+
+  req [label="普通 request\nSTATE_SENDING_CMD", fillcolor="#dbeafe", color="#93c5fd"];
+  prep [label="prepare_command(CMD11)\n设 VOLT_SWITCH\n状态改 SENDING_CMD11\n关闭 low power", fillcolor="#fef9c3", color="#fde047"];
+  start [label="start CMD11\n启动 cmd11_timer", fillcolor="#ffedd5", color="#fdba74"];
+  done [label="CMD11 IRQ/timer\nEVENT_CMD_COMPLETE", fillcolor="#fee2e2", color="#fca5a5"];
+  end [label="request_end()\n状态改 WAITING_CMD11_DONE", fillcolor="#ede9fe", color="#c4b5fd"];
+  bus [label="setup_bus()\nUPD_CLK 继续带 VOLT_SWITCH", fillcolor="#dcfce7", color="#86efac"];
+  ios [label="set_ios(clock != 0)\n状态回 IDLE", fillcolor="#d1fae5", color="#6ee7b7"];
+
+  req -> prep -> start -> done -> end -> bus -> ios;
+}

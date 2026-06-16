@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>02. 一个 request 的生命周期 - dw_mmc.c 从 0 吃透</title>
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">dw_mmc.c 从 0 吃透</div>
+      <div class="subtitle">DesignWare MMC host driver deep dive</div>
+      <nav class="nav">
+<a href="index.html" class="">阅读路线</a>
+<a href="00_mental_model.html" class="">00. 先建立心智模型</a>
+<a href="01_probe_and_host_registration.html" class="">01. probe 与 host 注册</a>
+<a href="02_request_lifecycle.html" class="active">02. 一个 request 的生命周期</a>
+<a href="03_data_path_dma_pio.html" class="">03. 数据路径：DMA、PIO 与 FIFO</a>
+<a href="04_interrupts_timers_tasklet.html" class="">04. IRQ/timer/tasklet 状态机</a>
+<a href="05_power_clock_voltage_sdio_pm.html" class="">05. 时钟、电源、CMD11 与 SDIO IRQ</a>
+<a href="06_reading_and_debugging.html" class="">06. 调试与读代码方法</a>
+      </nav>
+    </aside>
+    <main class="content-wrap">
+      <article class="content">
+<h1 id="02-一个-request-的生命周期">02. 一个 request 的生命周期</h1>
+<p>这一篇只讲一次 <code>mmc_request</code> 怎么从进入驱动到回调
+<code>mmc_request_done()</code>。先不纠结所有错误分支，把正常读/写路径跑通，后面看
+tasklet 状态机会轻很多。</p>
+<p><img src="assets/request_lifecycle.svg" alt="request 生命周期" /></p>
+<h2 id="1-从-mmc-core-进入dw_mci_request">1. 从 MMC core
+进入：<code>dw_mci_request()</code></h2>
+<p>MMC core 调 <code>.request</code> 后进入
+<code>dw_mci_request()</code>，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1469</code>。这个函数做三件事：</p>
+<ol type="1">
+<li>通过 <code>mmc_priv(mmc)</code> 找到 <code>slot</code>，再找
+<code>host</code>。</li>
+<li>检查卡是否存在；如果不存在，直接给
+<code>mrq-&gt;cmd-&gt;error = -ENOMEDIUM</code> 并
+<code>mmc_request_done()</code>。</li>
+<li>拿 <code>host-&gt;lock</code>，把请求交给
+<code>dw_mci_queue_request()</code>。</li>
+</ol>
+<p>这里还可以看到一个 Rockchip/RV1106
+特例：<code>host-&gt;is_rv1106_sd</code> 时请求前会 reset 控制器，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1490</code>。</p>
+<h2 id="2-排队与立即启动dw_mci_queue_request">2.
+排队与立即启动：<code>dw_mci_queue_request()</code></h2>
+<p><code>dw_mci_queue_request()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1441</code>。它是“控制器级串行化”的入口。逻辑很简单：</p>
+<table>
+<thead>
+<tr class="header">
+<th>当前状态</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>STATE_IDLE</code></td>
+<td>设置 <code>STATE_SENDING_CMD</code>，立即
+<code>dw_mci_start_request()</code></td>
+</tr>
+<tr class="even">
+<td>其他状态</td>
+<td>把 slot 挂到
+<code>host-&gt;queue</code>，等当前请求结束后再启动</td>
+</tr>
+<tr class="odd">
+<td><code>STATE_WAITING_CMD11_DONE</code></td>
+<td>打 warning，并尽量恢复到 <code>STATE_IDLE</code> 后继续</td>
+</tr>
+</tbody>
+</table>
+<p>这说明 <code>dw_mmc.c</code> 的请求状态机一次只处理一个 active
+request。排队发生在 host 层，不是每个状态都能并发推进。</p>
+<h2 id="3-选择首个命令sbc-优先">3. 选择首个命令：<code>sbc</code>
+优先</h2>
+<p><code>dw_mci_start_request()</code> 很短，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1430</code>。它只做一件重要的事：如果
+request 有 <code>mrq-&gt;sbc</code>，先发 <code>sbc</code>；否则发
+<code>mrq-&gt;cmd</code>。</p>
+<p><code>sbc</code> 是 set block count 命令。tasklet 后面会在
+<code>sbc</code> 成功完成时重新调用
+<code>__dw_mci_start_request()</code> 去发真正的
+<code>mrq-&gt;cmd</code>，对应分支在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2204</code>。</p>
+<h2 id="4-真正启动请求__dw_mci_start_request">4.
+真正启动请求：<code>__dw_mci_start_request()</code></h2>
+<p><code>__dw_mci_start_request()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1363</code>。它是一次 request
+的启动核心，可以按顺序读：</p>
+<table>
+<thead>
+<tr class="header">
+<th style="text-align: right;">顺序</th>
+<th style="text-align: right;">代码位置</th>
+<th>做了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">1</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1373</code></td>
+<td><code>host-&gt;mrq = mrq</code>，清空
+<code>pending_events/completed_events/cmd_status/data_status/dir_status</code></td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">2</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1384</code></td>
+<td>如果命令带 data，设置 <code>TMOUT/BYTCNT/BLKSIZ</code></td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">3</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1394</code></td>
+<td><code>dw_mci_prepare_command()</code> 组装 CMDR bits</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">4</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1400</code></td>
+<td>有 data 时先 <code>dw_mci_submit_data()</code> 准备 DMA/PIO</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">5</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1405</code></td>
+<td><code>dw_mci_start_command()</code> 写
+CMDARG/CMD，真正启动硬件命令</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">6</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1407</code></td>
+<td>CMD11 特殊 timer</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">7</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1427</code></td>
+<td>预先计算 stop/abort 命令寄存器值</td>
+</tr>
+</tbody>
+</table>
+<p>一个关键点：有数据的请求会先准备 data path，再发
+command。原因是命令一旦被控制器接受，数据中断/DMA
+可能很快发生；驱动必须提前把 DMA/PIO/FIFO 环境布好。</p>
+<h2 id="5-命令是如何启动的">5. 命令是如何启动的</h2>
+<p><code>dw_mci_prepare_command()</code> 在
+<code>kernel/drivers/mmc/host/dw_mmc.c:283</code>。它根据
+opcode、response 类型、是否带 data、是否需要 stop、是否 CMD11 来设置
+CMDR bits。</p>
+<p><code>dw_mci_start_command()</code> 在
+<code>kernel/drivers/mmc/host/dw_mmc.c:428</code>。它把
+<code>host-&gt;cmd</code> 指向当前命令，写
+<code>CMDARG</code>，等待控制器不 busy，写
+<code>CMD | START</code>。如果命令期待 response，还会启动 command
+timeout timer，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:442</code>。</p>
+<p>命令完成后，IRQ 或 CTO timer 会设置
+<code>EVENT_CMD_COMPLETE</code>。tasklet 消费后调用
+<code>dw_mci_command_complete()</code>，读取 response 并把
+RTO/RCRC/RESP_ERR 转换成 <code>cmd-&gt;error</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:2004</code>。</p>
+<h2 id="6-请求如何结束dw_mci_request_end">6.
+请求如何结束：<code>dw_mci_request_end()</code></h2>
+<p><code>dw_mci_request_end()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1967</code>。它是所有成功/失败路径最终汇合点。核心逻辑：</p>
+<ol type="1">
+<li>当前 request 已经没有 <code>host-&gt;cmd</code> 和
+<code>host-&gt;data</code>，否则 <code>WARN_ON</code>。</li>
+<li>如果队列非空，取下一个 slot，设置
+<code>STATE_SENDING_CMD</code>，直接启动下一个 request，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1980</code>。</li>
+<li>如果队列为空，普通情况回 <code>STATE_IDLE</code>；如果刚完成的是
+CMD11，则进入 <code>STATE_WAITING_CMD11_DONE</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1992</code>。</li>
+<li>解锁后调用
+<code>mmc_request_done(prev_mmc, mrq)</code>，再重新加锁，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1998</code>。</li>
+</ol>
+<p>解锁再回调是必要的：<code>mmc_request_done()</code>
+可能触发上层继续提交请求，驱动不能在持有 host lock 时把控制权交回 MMC
+core。</p>
+<h2 id="7-三条最常见请求路径">7. 三条最常见请求路径</h2>
+<table>
+<thead>
+<tr class="header">
+<th>请求类型</th>
+<th>主路径</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>无数据命令</td>
+<td><code>request -&gt; queue -&gt; start command -&gt; EVENT_CMD_COMPLETE -&gt; command_complete -&gt; request_end</code></td>
+</tr>
+<tr class="even">
+<td>正常读/写</td>
+<td><code>request -&gt; submit_data -&gt; start command -&gt; CMD complete -&gt; SENDING_DATA -&gt; XFER complete -&gt; DATA_BUSY -&gt; DATA complete -&gt; request_end/stop</code></td>
+</tr>
+<tr class="odd">
+<td>多块读写带 stop</td>
+<td>正常数据路径完成后，若需要 <code>data-&gt;stop</code> 且不是
+<code>sbc</code> 请求，发送 stop/abort，进入
+<code>STATE_SENDING_STOP</code>，等待 stop 命令完成后
+<code>request_end</code></td>
+</tr>
+</tbody>
+</table>
+<p>读 tasklet
+时，把这三条路径放在脑子里，复杂分支就容易归位：它们不是随意跳转，而是在处理命令失败、数据失败、stop
+失败、CMD11 这几个例外。</p>
+
+        <div class="footer">Generated as a static GitHub Pages site from the Markdown source in this repository.</div>
+      </article>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,46 @@
+digraph G {
+  graph [rankdir=LR, bgcolor="white", pad="0.25", nodesep="0.55", ranksep="0.75", splines=ortho];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC, Arial", fontsize=15, margin="0.16,0.10", color="#cbd5e1", fillcolor="#f8fafc"];
+  edge [fontname="Noto Sans CJK SC, Arial", fontsize=12, color="#475569", arrowsize=0.8];
+
+  subgraph cluster_core {
+    label="MMC core"; color="#dbeafe"; style="rounded,filled"; fillcolor="#eff6ff"; fontsize=18; fontname="Noto Sans CJK SC, Arial";
+    mmc [label="mmc core\n枚举 / 调度 / block / SDIO", fillcolor="#dbeafe", color="#93c5fd"];
+    ops [label="mmc_host_ops\nrequest / set_ios / pre_req / post_req", fillcolor="#e0f2fe", color="#7dd3fc"];
+  }
+
+  subgraph cluster_driver {
+    label="dw_mmc.c common core"; color="#dcfce7"; style="rounded,filled"; fillcolor="#f0fdf4"; fontsize=18; fontname="Noto Sans CJK SC, Arial";
+    probe [label="dw_mci_probe()\nclock/reset/DMA/IRQ/tasklet/slot", fillcolor="#dcfce7", color="#86efac"];
+    host [label="struct dw_mci\nmrq/cmd/data/state/events/queue", fillcolor="#ecfccb", color="#bef264"];
+    req [label="request lifecycle\ndw_mci_request() -> start_request()", fillcolor="#fef9c3", color="#fde047"];
+    events [label="pending_events\nCMD / XFER / DATA / ERROR", fillcolor="#fee2e2", color="#fca5a5"];
+    tasklet [label="dw_mci_tasklet_func()\n消费事件 + 推进状态", fillcolor="#ede9fe", color="#c4b5fd"];
+    end [label="dw_mci_request_end()\nqueue next 或 mmc_request_done()", fillcolor="#f1f5f9", color="#94a3b8"];
+  }
+
+  subgraph cluster_hw {
+    label="DesignWare MMC hardware"; color="#ffedd5"; style="rounded,filled"; fillcolor="#fff7ed"; fontsize=18; fontname="Noto Sans CJK SC, Arial";
+    regs [label="registers\nCMD / STATUS / INTMASK / FIFO", fillcolor="#ffedd5", color="#fdba74"];
+    dma [label="DMA/PIO/FIFO\nIDMAC / EDMAC / PIO", fillcolor="#fef3c7", color="#fbbf24"];
+    irq [label="IRQ + timers\nMINTSTS / CTO / DTO / xfer", fillcolor="#ffe4e6", color="#fda4af"];
+  }
+
+  wrapper [label="SoC wrapper\n填充 struct dw_mci + 调 probe", fillcolor="#e2e8f0", color="#94a3b8"];
+
+  wrapper -> probe [label="probe"];
+  probe -> host [label="初始化"];
+  probe -> regs [label="reset/config"];
+  probe -> ops [label="mmc_add_host"];
+  mmc -> ops;
+  ops -> req [label=".request"];
+  ops -> host [label=".set_ios / SDIO / tuning"];
+  req -> regs [label="写 CMDARG/CMD/BYTCNT"];
+  req -> dma [label="准备 DMA/PIO"];
+  regs -> irq [label="硬件中断"];
+  dma -> events [label="XFER_COMPLETE"];
+  irq -> events [label="CMD/DATA/ERROR"];
+  events -> tasklet;
+  tasklet -> end;
+  end -> mmc [label="mmc_request_done"];
+}

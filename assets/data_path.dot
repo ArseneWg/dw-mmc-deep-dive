@@ -1,0 +1,24 @@
+digraph G {
+  graph [rankdir=TB, bgcolor="white", pad="0.2", nodesep="0.45", ranksep="0.55"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC, Arial", fontsize=14, margin="0.16,0.10", color="#cbd5e1", fillcolor="#f8fafc"];
+  edge [fontname="Noto Sans CJK SC, Arial", fontsize=12, color="#475569", arrowsize=0.8];
+
+  submit [label="dw_mci_submit_data(data)\n设置 host->data / dir_status", fillcolor="#dcfce7", color="#86efac"];
+  trydma [label="dw_mci_submit_data_dma()\n检查 host->use_dma + sg/map/alignment", fillcolor="#fef9c3", color="#fde047"];
+  dmaok [label="DMA 成功\nusing_dma=1, 开 DMA, 关 RXDR/TXDR", fillcolor="#dbeafe", color="#93c5fd"];
+  dmafinish [label="DMA callback\nEVENT_XFER_COMPLETE", fillcolor="#bfdbfe", color="#60a5fa"];
+  pio [label="PIO 回退\nsg_miter + 开 RXDR/TXDR + 关 DMA", fillcolor="#ffedd5", color="#fdba74"];
+  rx [label="RXDR/TXDR IRQ\nread_data_pio / write_data_pio", fillcolor="#fed7aa", color="#fb923c"];
+  piofinish [label="SG 搬完\nEVENT_XFER_COMPLETE", fillcolor="#fde68a", color="#f59e0b"];
+  dataover [label="DATA_OVER IRQ\nEVENT_DATA_COMPLETE", fillcolor="#dcfce7", color="#86efac"];
+  task [label="tasklet\nSENDING_DATA -> DATA_BUSY -> request_end/stop", fillcolor="#ede9fe", color="#c4b5fd"];
+  err [label="DATA_ERROR IRQ/timer\nEVENT_DATA_ERROR", fillcolor="#fee2e2", color="#fca5a5"];
+
+  submit -> trydma;
+  trydma -> dmaok [label="可 DMA"];
+  trydma -> pio [label="不可 DMA / start 失败"];
+  dmaok -> dmafinish -> task;
+  pio -> rx -> piofinish -> task;
+  dataover -> task;
+  err -> task;
+}

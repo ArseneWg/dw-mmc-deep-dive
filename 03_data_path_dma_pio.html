@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>03. 数据路径：DMA、PIO 与 FIFO - dw_mmc.c 从 0 吃透</title>
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">dw_mmc.c 从 0 吃透</div>
+      <div class="subtitle">DesignWare MMC host driver deep dive</div>
+      <nav class="nav">
+<a href="index.html" class="">阅读路线</a>
+<a href="00_mental_model.html" class="">00. 先建立心智模型</a>
+<a href="01_probe_and_host_registration.html" class="">01. probe 与 host 注册</a>
+<a href="02_request_lifecycle.html" class="">02. 一个 request 的生命周期</a>
+<a href="03_data_path_dma_pio.html" class="active">03. 数据路径：DMA、PIO 与 FIFO</a>
+<a href="04_interrupts_timers_tasklet.html" class="">04. IRQ/timer/tasklet 状态机</a>
+<a href="05_power_clock_voltage_sdio_pm.html" class="">05. 时钟、电源、CMD11 与 SDIO IRQ</a>
+<a href="06_reading_and_debugging.html" class="">06. 调试与读代码方法</a>
+      </nav>
+    </aside>
+    <main class="content-wrap">
+      <article class="content">
+<h1 id="03-数据路径dmapio-与-fifo">03. 数据路径：DMA、PIO 与 FIFO</h1>
+<p>数据路径是 <code>dw_mmc.c</code>
+里最容易和状态机混在一起的部分。先抓住一个原则：<code>dw_mci_submit_data()</code>
+只是把“怎么搬数据”准备好，真正判断“请求是否结束”仍然在 tasklet 里。</p>
+<p><img src="assets/data_path.svg" alt="数据路径" /></p>
+<h2 id="1-数据请求启动前做了什么">1. 数据请求启动前做了什么</h2>
+<p>有 data 的命令在 <code>__dw_mci_start_request()</code>
+里先设置数据相关寄存器，再发命令。关键代码在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1384</code> 到
+<code>kernel/drivers/mmc/host/dw_mmc.c:1405</code>：</p>
+<ul>
+<li><code>dw_mci_set_data_timeout()</code> 根据
+<code>data-&gt;timeout_ns</code> 配 TMOUT。</li>
+<li><code>BYTCNT = blksz * blocks</code>，<code>BLKSIZ = blksz</code>。</li>
+<li><code>dw_mci_submit_data()</code> 设置 DMA/PIO。</li>
+<li>最后才 <code>dw_mci_start_command()</code>。</li>
+</ul>
+<p>这个顺序说明 data path
+是命令启动前的准备工作，不是命令完成后才开始配置。</p>
+<h2 id="2-dma-预映射pre_reqpost_req">2. DMA
+预映射：<code>pre_req/post_req</code></h2>
+<p><code>dw_mci_pre_req()</code> 和 <code>dw_mci_post_req()</code> 是
+<code>mmc_host_ops</code> 暴露给 core 的优化入口，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:960</code> 和
+<code>kernel/drivers/mmc/host/dw_mmc.c:977</code>。</p>
+<p><code>pre_req</code> 会尝试提前 <code>dma_map_sg()</code>，成功则把
+<code>data-&gt;host_cookie</code> 标成
+<code>COOKIE_PRE_MAPPED</code>。真正请求开始时，<code>dw_mci_pre_dma_transfer()</code>
+如果发现已经 pre-mapped，就直接返回 <code>sg_len</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:929</code>。</p>
+<p>这层优化不改变状态机，只减少请求开始时的 DMA mapping 成本。</p>
+<h2 id="3-dma-选择与失败回退">3. DMA 选择与失败回退</h2>
+<p><code>dw_mci_init_dma()</code> 在 probe 阶段根据 HCON 选择
+IDMAC、EDMAC 或 PIO，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:3235</code>。大意是：</p>
+<table>
+<thead>
+<tr class="header">
+<th>HCON transfer mode</th>
+<th>驱动内部模式</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>internal DMA</td>
+<td><code>TRANS_MODE_IDMAC</code></td>
+<td>使用控制器内部 IDMAC descriptor ring</td>
+</tr>
+<tr class="even">
+<td>DW DMA / generic DMA</td>
+<td><code>TRANS_MODE_EDMAC</code></td>
+<td>使用外部 DMA engine channel</td>
+</tr>
+<tr class="odd">
+<td>no usable DMA</td>
+<td><code>TRANS_MODE_PIO</code></td>
+<td>CPU 通过 FIFO 读写</td>
+</tr>
+</tbody>
+</table>
+<p>真正每次请求是否走 DMA，在 <code>dw_mci_submit_data_dma()</code>
+里决定，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1128</code>。它会：</p>
+<ol type="1">
+<li>检查 <code>host-&gt;use_dma</code>，没有 DMA 则返回失败。</li>
+<li>调 <code>dw_mci_pre_dma_transfer()</code> 检查长度、block size、SG
+offset/length 是否适合 DMA，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:922</code>。</li>
+<li>设置 <code>host-&gt;using_dma = 1</code>。</li>
+<li>调整 FIFO watermark，打开 <code>SDMMC_CTRL_DMA_ENABLE</code>，屏蔽
+RXDR/TXDR PIO 中断。</li>
+<li>调 <code>dma_ops-&gt;start()</code>。如果 start 失败，停止 DMA
+并让当前请求回退 PIO，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1175</code>。</li>
+</ol>
+<p>因此，<code>host-&gt;use_dma</code> 表示这个 host 支持哪种
+DMA，<code>host-&gt;using_dma</code> 表示当前 request 是否真的在用
+DMA。这两个字段不能混为一谈。</p>
+<h2 id="4-pio-路径做了什么">4. PIO 路径做了什么</h2>
+<p>当 <code>dw_mci_submit_data_dma()</code>
+失败时，<code>dw_mci_submit_data()</code> 进入 PIO 分支，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1187</code>。</p>
+<p>PIO 分支会启动 SG iterator，设置 <code>host-&gt;sg</code>，清 partial
+buffer，打开 RXDR/TXDR 中断，关闭
+<code>SDMMC_CTRL_DMA_ENABLE</code>，并恢复 PIO 用的 FIFOTH，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1206</code> 到
+<code>kernel/drivers/mmc/host/dw_mmc.c:1239</code>。</p>
+<p>真正搬数据的是 IRQ handler 调用的两个函数：</p>
+<ul>
+<li>读：<code>dw_mci_read_data_pio()</code>，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2810</code>。它根据 FIFO count 从
+FIFO 拉数据，更新 <code>data-&gt;bytes_xfered</code>。</li>
+<li>写：<code>dw_mci_write_data_pio()</code>，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2866</code>。它根据 FIFO
+剩余空间往 FIFO 推数据，更新 <code>data-&gt;bytes_xfered</code>。</li>
+</ul>
+<p>PIO 读写完成 SG 后，会设置 <code>EVENT_XFER_COMPLETE</code>。读路径在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2861</code>，写路径在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2917</code>。</p>
+<h2 id="5-dma-完成只代表内存侧搬完">5. DMA 完成只代表内存侧搬完</h2>
+<p>DMA callback 是 <code>dw_mci_dmac_complete_dma()</code>，定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:510</code>。它做
+cleanup，然后设置 <code>EVENT_XFER_COMPLETE</code> 并 schedule
+tasklet，见 <code>kernel/drivers/mmc/host/dw_mmc.c:532</code>。</p>
+<p>这个事件名字容易误导：<code>XFER_COMPLETE</code> 不是整个 MMC data
+transaction 完成，只是驱动认为内存/FIFO/DMA 这侧 transfer
+已完成。卡侧是否真正 data over，要等主控制器中断
+<code>SDMMC_INT_DATA_OVER</code>，IRQ handler 在
+<code>kernel/drivers/mmc/host/dw_mmc.c:3005</code> 设置
+<code>EVENT_DATA_COMPLETE</code>。</p>
+<p>这就是 tasklet 里为什么有两个状态：</p>
+<table>
+<thead>
+<tr class="header">
+<th>状态</th>
+<th>等待事件</th>
+<th>意义</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>STATE_SENDING_DATA</code></td>
+<td><code>EVENT_XFER_COMPLETE</code></td>
+<td>等内存侧/DMA/PIO 搬完</td>
+</tr>
+<tr class="even">
+<td><code>STATE_DATA_BUSY</code></td>
+<td><code>EVENT_DATA_COMPLETE</code></td>
+<td>等卡侧 data over，确认 data status</td>
+</tr>
+</tbody>
+</table>
+<p>如果把这两个事件合成一个“data done”，状态机会立刻变得难懂。</p>
+<h2 id="6-dw_mci_data_complete-只在-data-over-后判断最终-data-error">6.
+<code>dw_mci_data_complete()</code> 只在 data over 后判断最终 data
+error</h2>
+<p><code>dw_mci_data_complete()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2037</code>。它读取
+<code>host-&gt;data_status</code>，根据 DRTO/DCRC/EBE/SBE 映射成
+<code>data-&gt;error</code>。没有错误时设置
+<code>data-&gt;bytes_xfered = blocks * blksz</code>。</p>
+<p>这也解释了一个现象：PIO/DMA 路径可能已经更新过
+<code>bytes_xfered</code>，但最终成功时
+<code>dw_mci_data_complete()</code>
+会按完整块数覆盖为全量。错误时则根据错误类型处理，必要时 reset 控制器清
+FIFO，见 <code>kernel/drivers/mmc/host/dw_mmc.c:2070</code>。</p>
+<h2 id="7-读数据路径时的检查清单">7. 读数据路径时的检查清单</h2>
+<p>排查“数据没回来”时，不要只盯着 tasklet 状态。按下面顺序看：</p>
+<ol type="1">
+<li>当前请求是否有 <code>data</code>，<code>BYTCNT/BLKSIZ</code>
+是否设置。</li>
+<li><code>host-&gt;use_dma</code> 是 IDMAC、EDMAC 还是 PIO。</li>
+<li>当前请求 <code>host-&gt;using_dma</code> 是否为 1。</li>
+<li>如果 DMA，callback 有没有设置
+<code>EVENT_XFER_COMPLETE</code>。</li>
+<li>如果 PIO，RXDR/TXDR 中断是否持续触发，<code>host-&gt;sg</code>
+是否走到 NULL。</li>
+<li><code>EVENT_XFER_COMPLETE</code> 和 <code>EVENT_DATA_COMPLETE</code>
+哪一个缺失。</li>
+<li><code>host-&gt;data_status</code> 是否带 DRTO/DCRC/EBE/SBE。</li>
+</ol>
+
+        <div class="footer">Generated as a static GitHub Pages site from the Markdown source in this repository.</div>
+      </article>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,20 @@
+digraph G {
+  graph [rankdir=TB, bgcolor="white", pad="0.2", nodesep="0.45", ranksep="0.55"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC, Arial", fontsize=15, margin="0.16,0.10", color="#cbd5e1", fillcolor="#f8fafc"];
+  edge [fontname="Noto Sans CJK SC, Arial", fontsize=12, color="#475569", arrowsize=0.8];
+
+  start [label="SoC wrapper 调 dw_mci_probe(host)", fillcolor="#e2e8f0"];
+  dt [label="解析 pdata / DT\nreset, fifo-depth, detect delay, data-addr", fillcolor="#dbeafe", color="#93c5fd"];
+  clk [label="使能 biu / ciu clock\n得到 host->bus_hz", fillcolor="#e0f2fe", color="#7dd3fc"];
+  reset [label="reset controller\n调用 drv_data->init()", fillcolor="#dcfce7", color="#86efac"];
+  base [label="timer / spinlock / queue / fault injection", fillcolor="#fef9c3", color="#fde047"];
+  width [label="根据 HCON 选择 FIFO 16/32/64-bit 访问函数", fillcolor="#fef3c7", color="#fbbf24"];
+  dma [label="dw_mci_init_dma()\nIDMAC / EDMAC / PIO", fillcolor="#ffedd5", color="#fdba74"];
+  intr [label="清中断, 设 TMOUT/FIFOTH\n定位 DATA register", fillcolor="#fee2e2", color="#fca5a5"];
+  irq [label="tasklet_setup + request_irq\n打开基础 INTMASK/CTRL", fillcolor="#ede9fe", color="#c4b5fd"];
+  slot [label="dw_mci_init_slot()\nmmc_alloc_host + mmc->ops + caps", fillcolor="#dcfce7", color="#86efac"];
+  add [label="mmc_add_host()\nMMC core 开始接管", fillcolor="#d1fae5", color="#6ee7b7"];
+  cd [label="enable card detect", fillcolor="#f1f5f9", color="#94a3b8"];
+
+  start -> dt -> clk -> reset -> base -> width -> dma -> intr -> irq -> slot -> add -> cd;
+}

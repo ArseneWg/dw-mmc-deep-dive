@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>05. 时钟、电源、CMD11 与 SDIO IRQ - dw_mmc.c 从 0 吃透</title>
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">dw_mmc.c 从 0 吃透</div>
+      <div class="subtitle">DesignWare MMC host driver deep dive</div>
+      <nav class="nav">
+<a href="index.html" class="">阅读路线</a>
+<a href="00_mental_model.html" class="">00. 先建立心智模型</a>
+<a href="01_probe_and_host_registration.html" class="">01. probe 与 host 注册</a>
+<a href="02_request_lifecycle.html" class="">02. 一个 request 的生命周期</a>
+<a href="03_data_path_dma_pio.html" class="">03. 数据路径：DMA、PIO 与 FIFO</a>
+<a href="04_interrupts_timers_tasklet.html" class="">04. IRQ/timer/tasklet 状态机</a>
+<a href="05_power_clock_voltage_sdio_pm.html" class="active">05. 时钟、电源、CMD11 与 SDIO IRQ</a>
+<a href="06_reading_and_debugging.html" class="">06. 调试与读代码方法</a>
+      </nav>
+    </aside>
+    <main class="content-wrap">
+      <article class="content">
+<h1 id="05-时钟电源cmd11-与-sdio-irq">05. 时钟、电源、CMD11 与 SDIO
+IRQ</h1>
+<p>这一篇讲不直接属于 request 的路径，但它们会影响 request
+状态机：<code>set_ios()</code>、<code>setup_bus()</code>、信号电压切换、SDIO
+IRQ、runtime PM。很多“状态机为什么卡住”的问题，其实根在
+clock/power/low-power mode。</p>
+<p><img src="assets/power_clock_cmd11.svg" alt="时钟与电源" /></p>
+<h2 id="1-dw_mci_set_ios-是-mmc-core-配置硬件状态的主入口">1.
+<code>dw_mci_set_ios()</code> 是 MMC core 配置硬件状态的主入口</h2>
+<p><code>dw_mci_set_ios()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1498</code>，由
+<code>mmc_host_ops.set_ios</code> 暴露给 MMC core，ops 表在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1888</code>。</p>
+<p>它按顺序处理：</p>
+<table>
+<thead>
+<tr class="header">
+<th>内容</th>
+<th style="text-align: right;">代码位置</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>bus width</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1505</code></td>
+<td>根据 1/4/8-bit 设置 <code>slot-&gt;ctype</code></td>
+</tr>
+<tr class="even">
+<td>timing/DDR</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1517</code></td>
+<td>修改 <code>UHS_REG</code> DDR bit，保存
+<code>host-&gt;timing</code></td>
+</tr>
+<tr class="odd">
+<td>clock mirror</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1530</code></td>
+<td><code>slot-&gt;clock = ios-&gt;clock</code>，避免 core 更新竞态</td>
+</tr>
+<tr class="even">
+<td>平台 set_ios hook</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1536</code></td>
+<td>SoC 私有配置入口</td>
+</tr>
+<tr class="odd">
+<td>power mode</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1539</code></td>
+<td><code>POWER_UP/ON/OFF</code> 分别处理
+regulator、pinctrl、reset、clock</td>
+</tr>
+<tr class="even">
+<td>CMD11 收尾状态</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1620</code></td>
+<td><code>WAITING_CMD11_DONE</code> 且 clock 非 0 时回
+<code>IDLE</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>set_ios()</code> 不是简单设置寄存器。它既处理电源，也处理
+pinctrl、reset、clock、timing，还会影响 CMD11 状态机。</p>
+<h2 id="2-dw_mci_setup_bus-的-clock-更新顺序">2.
+<code>dw_mci_setup_bus()</code> 的 clock 更新顺序</h2>
+<p><code>dw_mci_setup_bus()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1250</code>。它的核心流程是：</p>
+<ol type="1">
+<li>如果当前处于 <code>STATE_WAITING_CMD11_DONE</code>，clock update
+命令继续带 <code>SDMMC_CMD_VOLT_SWITCH</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1258</code>。</li>
+<li>clock 为 0 时，关闭 <code>CLKENA</code> 并通知 CIU，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1264</code>。</li>
+<li>clock 改变或强制初始化时，先 disable clock，再清
+<code>CLKSRC</code>，发 <code>UPD_CLK</code>。</li>
+<li>写 <code>CLKDIV</code>，再发 <code>UPD_CLK</code>。</li>
+<li>重新 enable clock，并根据 <code>DW_MMC_CARD_NO_LOW_PWR</code>
+决定是否开 low power clock stop，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1311</code>。</li>
+<li>更新
+<code>slot-&gt;__clk_old</code>、<code>mmc-&gt;actual_clock</code>、<code>host-&gt;current_speed</code>，最后写
+<code>CTYPE</code>。</li>
+</ol>
+<p>这个函数会频繁通过
+<code>mci_send_cmd(slot, SDMMC_CMD_UPD_CLK | SDMMC_CMD_PRV_DAT_WAIT, 0)</code>
+通知 CIU。它不是普通 MMC 命令路径，不走
+<code>mmc_request</code>，但会直接操作控制器命令寄存器。</p>
+<h2 id="3-cmd11-为什么跨多个函数">3. CMD11 为什么跨多个函数</h2>
+<p>CMD11 的完整链路：</p>
+<table>
+<thead>
+<tr class="header">
+<th>阶段</th>
+<th style="text-align: right;">代码位置</th>
+<th>做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>准备命令</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:301</code></td>
+<td>设置 <code>SDMMC_CMD_VOLT_SWITCH</code>，状态改
+<code>STATE_SENDING_CMD11</code>，临时关闭 low power mode</td>
+</tr>
+<tr class="even">
+<td>启动命令</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1407</code></td>
+<td>设置 500ms 级 CMD11 timer</td>
+</tr>
+<tr class="odd">
+<td>IRQ 特判</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2951</code></td>
+<td>voltage switch interrupt 先处理，避免被当成普通错误</td>
+</tr>
+<tr class="even">
+<td>request 收尾</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1992</code></td>
+<td>从 <code>STATE_SENDING_CMD11</code> 进入
+<code>STATE_WAITING_CMD11_DONE</code></td>
+</tr>
+<tr class="odd">
+<td>clock update</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1258</code></td>
+<td><code>setup_bus()</code> 继续带 <code>VOLT_SWITCH</code> bit</td>
+</tr>
+<tr class="even">
+<td>set_ios 收尾</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:1620</code></td>
+<td>clock 非 0 后回 <code>STATE_IDLE</code></td>
+</tr>
+</tbody>
+</table>
+<p>所以看到 <code>STATE_WAITING_CMD11_DONE</code> 不要误以为 tasklet
+在等一个事件。它等的是后续 IOS/clock 流程把电压切换协议走完。</p>
+<h2 id="4-sdio-irq-与-low-power-mode">4. SDIO IRQ 与 low power mode</h2>
+<p>SDIO interrupt 的处理也会改 clock low power
+行为。<code>dw_mci_prepare_sdio_irq()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1722</code>。注释说明：低功耗模式会在
+idle 时停 card clock，但 SDIO interrupt 需要 clock 工作，所以使能 SDIO
+IRQ 时要关闭 low power clock stop。</p>
+<p>入口 <code>dw_mci_enable_sdio_irq()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1770</code>，它做三件事：</p>
+<ol type="1">
+<li>调 <code>dw_mci_prepare_sdio_irq()</code> 修改 <code>CLKENA</code>
+low-power bit。</li>
+<li>调 <code>__dw_mci_enable_sdio_irq()</code> 修改 <code>INTMASK</code>
+中对应 slot 的 SDIO interrupt bit，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1751</code>。</li>
+<li>SDIO IRQ 使能时 <code>pm_runtime_get_noresume()</code>，关闭时
+<code>pm_runtime_put_noidle()</code>，避免设备在需要接收 SDIO interrupt
+时 runtime suspend。</li>
+</ol>
+<p>主 IRQ 中看到 SDIO interrupt 时，会清中断、临时 disable 对应 SDIO
+IRQ，然后 <code>sdio_signal_irq()</code> 通知 core，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:3053</code>。core ack 后再通过
+<code>.ack_sdio_irq</code> 重新 enable，入口是
+<code>dw_mci_ack_sdio_irq()</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1785</code>。</p>
+<h2 id="5-reset-与-runtime-pm-对状态机的影响">5. reset 与 runtime PM
+对状态机的影响</h2>
+<p><code>dw_mci_reset()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:1817</code>。它会 stop SG
+iterator、reset CTRL/FIFO/DMA、清中断、等待 DMA_REQ
+消失、必要时重新初始化 IDMAC，并最后发
+<code>SDMMC_CMD_UPD_CLK</code>。错误路径里调用 reset
+不是“重启整个驱动”，而是把控制器内部 FIFO/DMA/中断状态拉回可控状态。</p>
+<p>runtime PM resume 会重新初始化 DMA、reset 控制器、恢复
+<code>FIFOTH/TMOUT/INTMASK/CTRL</code> 等，再对 keep-power 场景调用
+<code>set_ios()</code> 或强制 <code>setup_bus()</code>。相关代码从
+<code>kernel/drivers/mmc/host/dw_mmc.c:3835</code> 开始，其中恢复
+clock/bus 的关键调用在
+<code>kernel/drivers/mmc/host/dw_mmc.c:3906</code> 和
+<code>kernel/drivers/mmc/host/dw_mmc.c:3909</code>。</p>
+<h2 id="6-排查-clockpower-类问题的切入点">6. 排查 clock/power
+类问题的切入点</h2>
+<p>如果现象是“命令不完成”或“SDIO IRQ 丢”，不要只看 request
+状态机。同步检查：</p>
+<ul>
+<li><code>set_ios()</code> 是否把 <code>slot-&gt;clock</code>
+设置为预期值。</li>
+<li><code>setup_bus()</code> 后 <code>CLKENA/CLKDIV/CTYPE</code>
+是否符合预期。</li>
+<li>CMD11 后是否停在 <code>STATE_WAITING_CMD11_DONE</code>，以及后续
+<code>set_ios()</code> 是否被调用。</li>
+<li>SDIO IRQ 使能时是否设置 <code>DW_MMC_CARD_NO_LOW_PWR</code> 并保持
+runtime PM 引用。</li>
+<li>错误恢复是否 reset 后重新发了 <code>UPD_CLK</code>。</li>
+</ul>
+
+        <div class="footer">Generated as a static GitHub Pages site from the Markdown source in this repository.</div>
+      </article>
+    </main>
+  </div>
+</body>
+</html>

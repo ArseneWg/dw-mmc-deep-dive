@@ -1,0 +1,17 @@
+digraph G {
+  graph [rankdir=LR, bgcolor="white", pad="0.2", nodesep="0.50", ranksep="0.70", splines=ortho];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC, Arial", fontsize=14, margin="0.16,0.10", color="#cbd5e1", fillcolor="#f8fafc"];
+  edge [fontname="Noto Sans CJK SC, Arial", fontsize=12, color="#475569", arrowsize=0.8];
+
+  symptom [label="现象\n卡住 / 超时 / CRC / SDIO IRQ 丢", fillcolor="#fee2e2", color="#fca5a5"];
+  state [label="debugfs/state\n当前停在哪个状态", fillcolor="#dbeafe", color="#93c5fd"];
+  ev [label="pending_events / completed_events\n缺哪个事件位", fillcolor="#e0f2fe", color="#7dd3fc"];
+  req [label="debugfs/req\ncmd/data/stop/error/bytes", fillcolor="#fef9c3", color="#fde047"];
+  regs [label="debugfs/regs\nSTATUS/RINTSTS/CMD/CTRL/INTMASK/CLKENA", fillcolor="#ffedd5", color="#fdba74"];
+  code [label="回到源码锚点\nrequest / IRQ / DMA-PIO / tasklet / set_ios", fillcolor="#dcfce7", color="#86efac"];
+  fix [label="定位层级\n命令 / 数据搬运 / data over / clock-power", fillcolor="#ede9fe", color="#c4b5fd"];
+
+  symptom -> state -> ev -> code -> fix;
+  symptom -> req -> code;
+  symptom -> regs -> code;
+}

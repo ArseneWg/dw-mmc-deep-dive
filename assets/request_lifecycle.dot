@@ -1,0 +1,23 @@
+digraph G {
+  graph [rankdir=LR, bgcolor="white", pad="0.2", nodesep="0.55", ranksep="0.65", splines=ortho];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC, Arial", fontsize=14, margin="0.16,0.10", color="#cbd5e1", fillcolor="#f8fafc"];
+  edge [fontname="Noto Sans CJK SC, Arial", fontsize=12, color="#475569", arrowsize=0.8];
+
+  core [label="MMC core\n提交 mmc_request", fillcolor="#dbeafe", color="#93c5fd"];
+  req [label="dw_mci_request()\ncard detect + lock", fillcolor="#e0f2fe", color="#7dd3fc"];
+  queue [label="dw_mci_queue_request()\nIDLE 立即启动 / busy 入队", fillcolor="#fef9c3", color="#fde047"];
+  start [label="__dw_mci_start_request()\n清事件 + 配 data + 准备命令", fillcolor="#dcfce7", color="#86efac"];
+  data [label="dw_mci_submit_data()\nDMA 或 PIO 准备", fillcolor="#ffedd5", color="#fdba74"];
+  cmd [label="dw_mci_start_command()\n写 CMDARG/CMD", fillcolor="#d1fae5", color="#6ee7b7"];
+  irq [label="IRQ/timer/DMA/PIO\n设置 pending_events", fillcolor="#fee2e2", color="#fca5a5"];
+  sm [label="dw_mci_tasklet_func()\n命令 -> 数据 -> busy -> stop", fillcolor="#ede9fe", color="#c4b5fd"];
+  end [label="dw_mci_request_end()\n启动队列下一个或 IDLE", fillcolor="#f1f5f9", color="#94a3b8"];
+  done [label="mmc_request_done()", fillcolor="#e2e8f0", color="#94a3b8"];
+
+  core -> req -> queue -> start;
+  start -> data [label="有 data"];
+  start -> cmd;
+  data -> cmd;
+  cmd -> irq -> sm -> end -> done;
+  end -> start [label="queue 非空", style=dashed, color="#64748b"];
+}

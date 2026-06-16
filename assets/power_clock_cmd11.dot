@@ -1,0 +1,20 @@
+digraph G {
+  graph [rankdir=TB, bgcolor="white", pad="0.2", nodesep="0.45", ranksep="0.55"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC, Arial", fontsize=14, margin="0.16,0.10", color="#cbd5e1", fillcolor="#f8fafc"];
+  edge [fontname="Noto Sans CJK SC, Arial", fontsize=12, color="#475569", arrowsize=0.8];
+
+  ios [label="dw_mci_set_ios()\nMMC core 配置 bus/power/timing", fillcolor="#dbeafe", color="#93c5fd"];
+  width [label="bus_width -> slot->ctype\ntiming -> UHS_REG / host->timing", fillcolor="#e0f2fe", color="#7dd3fc"];
+  power [label="POWER_UP / ON / OFF\nregulator + pinctrl + PWREN + reset", fillcolor="#dcfce7", color="#86efac"];
+  setup [label="dw_mci_setup_bus()\nCLKENA/CLKDIV/CLKSRC/CTYPE + UPD_CLK", fillcolor="#fef9c3", color="#fde047"];
+  cmd11 [label="CMD11 特殊状态\nWAITING_CMD11_DONE 时 UPD_CLK 带 VOLT_SWITCH", fillcolor="#ede9fe", color="#c4b5fd"];
+  sdio [label="SDIO IRQ\n关闭 low power clock stop\n保持 runtime PM 引用", fillcolor="#ffedd5", color="#fdba74"];
+  idle [label="clock 非 0\nCMD11 状态回 IDLE", fillcolor="#d1fae5", color="#6ee7b7"];
+
+  ios -> width;
+  ios -> power;
+  power -> setup;
+  setup -> cmd11;
+  setup -> idle;
+  ios -> sdio [style=dashed, label="enable_sdio_irq 路径"];
+}

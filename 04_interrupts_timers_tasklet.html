@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>04. IRQ/timer/tasklet 状态机 - dw_mmc.c 从 0 吃透</title>
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">dw_mmc.c 从 0 吃透</div>
+      <div class="subtitle">DesignWare MMC host driver deep dive</div>
+      <nav class="nav">
+<a href="index.html" class="">阅读路线</a>
+<a href="00_mental_model.html" class="">00. 先建立心智模型</a>
+<a href="01_probe_and_host_registration.html" class="">01. probe 与 host 注册</a>
+<a href="02_request_lifecycle.html" class="">02. 一个 request 的生命周期</a>
+<a href="03_data_path_dma_pio.html" class="">03. 数据路径：DMA、PIO 与 FIFO</a>
+<a href="04_interrupts_timers_tasklet.html" class="active">04. IRQ/timer/tasklet 状态机</a>
+<a href="05_power_clock_voltage_sdio_pm.html" class="">05. 时钟、电源、CMD11 与 SDIO IRQ</a>
+<a href="06_reading_and_debugging.html" class="">06. 调试与读代码方法</a>
+      </nav>
+    </aside>
+    <main class="content-wrap">
+      <article class="content">
+<h1 id="04-irqtimertasklet-状态机">04. IRQ/timer/tasklet 状态机</h1>
+<p>这一篇是整个系列的核心。重点不是画出所有箭头，而是把状态机拆成“事件生产者”和“事件消费者”。<code>dw_mci_interrupt()</code>、DMA
+callback、PIO 函数、timer
+都只负责设置事件位；<code>dw_mci_tasklet_func()</code>
+才根据当前状态消费事件并推进请求。</p>
+<p><img src="assets/event_state_machine.svg" alt="事件与状态机" /></p>
+<h2 id="1-事件位是-irqtimer-与-tasklet-之间的邮箱">1. 事件位是 IRQ/timer
+与 tasklet 之间的邮箱</h2>
+<p>事件定义在 <code>kernel/drivers/mmc/host/dw_mmc.h:32</code>：</p>
+<table>
+<thead>
+<tr class="header">
+<th>事件</th>
+<th>生产者</th>
+<th>tasklet 中的含义</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>EVENT_CMD_COMPLETE</code></td>
+<td>CMD_DONE IRQ、command error IRQ、CTO timer、CMD11 timer</td>
+<td>当前命令有结果了，读取 response/status 并决定下一步</td>
+</tr>
+<tr class="even">
+<td><code>EVENT_XFER_COMPLETE</code></td>
+<td>DMA callback、PIO SG 搬完、错误 stop DMA</td>
+<td>内存侧 transfer 完成，可以进入/继续 data busy 收尾</td>
+</tr>
+<tr class="odd">
+<td><code>EVENT_DATA_COMPLETE</code></td>
+<td>DATA_OVER IRQ、部分 timeout/quirk 路径</td>
+<td>控制器/卡侧 data over，可以调用
+<code>dw_mci_data_complete()</code></td>
+</tr>
+<tr class="even">
+<td><code>EVENT_DATA_ERROR</code></td>
+<td>data error IRQ、DTO/xfer timer、fault injection</td>
+<td>数据路径出错，先 stop/abort 或 reset，再收尾</td>
+</tr>
+</tbody>
+</table>
+<p>头文件注释强调了顺序要求：设置事件位前必须先更新
+<code>cmd_status</code>、<code>data_status</code> 或
+<code>bytes_xfered</code>，并用 barrier 保证可见性，见
+<code>kernel/drivers/mmc/host/dw_mmc.h:146</code> 到
+<code>kernel/drivers/mmc/host/dw_mmc.h:157</code>。</p>
+<h2 id="2-irq-handler-负责把硬件中断翻译成事件">2. IRQ handler
+负责把硬件中断翻译成事件</h2>
+<p><code>dw_mci_interrupt()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2943</code>。它先读
+<code>MINTSTS</code>，再分块处理：</p>
+<table>
+<thead>
+<tr class="header">
+<th>硬件信号</th>
+<th style="text-align: right;">代码位置</th>
+<th>事件</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>CMD11 voltage switch interrupt</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2951</code></td>
+<td>当作 CMD complete，并删除 CMD11 timer</td>
+</tr>
+<tr class="even">
+<td>command error</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2969</code></td>
+<td>写 <code>cmd_status</code>，设置
+<code>EVENT_CMD_COMPLETE</code></td>
+</tr>
+<tr class="odd">
+<td>data error</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2983</code></td>
+<td>写 <code>data_status</code>，设置
+<code>EVENT_DATA_ERROR</code>，部分 quirk 还设置
+<code>EVENT_DATA_COMPLETE</code></td>
+</tr>
+<tr class="even">
+<td>data over</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:3005</code></td>
+<td>写 <code>data_status</code>，PIO 读尾部数据，设置
+<code>EVENT_DATA_COMPLETE</code></td>
+</tr>
+<tr class="odd">
+<td>RXDR/TXDR</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:3027</code></td>
+<td>PIO 读/写 FIFO，SG 完成时由 PIO 函数设置
+<code>EVENT_XFER_COMPLETE</code></td>
+</tr>
+<tr class="even">
+<td>CMD_DONE</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:3039</code></td>
+<td>调 <code>dw_mci_cmd_interrupt()</code>，设置
+<code>EVENT_CMD_COMPLETE</code></td>
+</tr>
+<tr class="odd">
+<td>IDMAC RI/TI</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:3062</code></td>
+<td>DMA complete callback 设置 <code>EVENT_XFER_COMPLETE</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>dw_mci_cmd_interrupt()</code> 本身很短：删除 command timeout
+timer，保存 <code>cmd_status</code>，设置
+<code>EVENT_CMD_COMPLETE</code>，schedule tasklet，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:2920</code>。</p>
+<h2 id="3-timer-也只是制造同类事件">3. timer 也只是制造同类事件</h2>
+<p>timer 的好处是它不引入第二套状态机。它们超时后仍然设置同样的事件，让
+tasklet 走同一套收尾逻辑。</p>
+<table>
+<thead>
+<tr class="header">
+<th>timer</th>
+<th style="text-align: right;">定义位置</th>
+<th>触发条件</th>
+<th>制造的事件</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>cmd11_timer</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:3326</code></td>
+<td>CMD11 长时间没有完成</td>
+<td><code>cmd_status = RTO</code>，<code>EVENT_CMD_COMPLETE</code></td>
+</tr>
+<tr class="even">
+<td><code>cto_timer</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:3340</code></td>
+<td>普通命令/stop 命令没有 CMD_DONE</td>
+<td><code>cmd_status = RTO</code>，<code>EVENT_CMD_COMPLETE</code></td>
+</tr>
+<tr class="odd">
+<td><code>xfer_timer</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:3395</code></td>
+<td><code>STATE_SENDING_DATA</code> 太久没有 xfer complete</td>
+<td><code>data_status = DRTO</code>，<code>EVENT_DATA_ERROR + EVENT_DATA_COMPLETE</code></td>
+</tr>
+<tr class="even">
+<td><code>dto_timer</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:3425</code></td>
+<td>data over 太久没来</td>
+<td><code>data_status = DRTO</code>，<code>EVENT_DATA_ERROR + EVENT_DATA_COMPLETE</code></td>
+</tr>
+</tbody>
+</table>
+<p>理解这一点后，timeout 路径就不需要单独画一张巨图：它和 IRQ
+路径最终都会进入 tasklet 的同一组分支。</p>
+<h2 id="4-tasklet-总体结构">4. tasklet 总体结构</h2>
+<p><code>dw_mci_tasklet_func()</code> 定义在
+<code>kernel/drivers/mmc/host/dw_mmc.c:2171</code>。它拿
+<code>host-&gt;lock</code>，读取
+<code>host-&gt;state</code>、<code>host-&gt;data</code>、<code>host-&gt;mrq</code>，然后用
+<code>do { prev_state = state; switch (state) ... } while (state != prev_state)</code>
+做有限状态推进，见 <code>kernel/drivers/mmc/host/dw_mmc.c:2181</code> 到
+<code>kernel/drivers/mmc/host/dw_mmc.c:2414</code>。</p>
+<p>这个循环的意义是：如果一个事件消费后可以立刻进入下一个状态，并且下一个状态的事件已经就绪，就在同一次
+tasklet 里继续推进；否则保存
+<code>host-&gt;state = state</code>，等下一次 IRQ/timer 再进来。</p>
+<h2 id="5-状态转移表正常路径">5. 状态转移表：正常路径</h2>
+<table>
+<thead>
+<tr class="header">
+<th>当前状态</th>
+<th>等什么</th>
+<th>做什么</th>
+<th>下一步</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>STATE_IDLE</code></td>
+<td>无</td>
+<td>空闲态不处理事件</td>
+<td>保持</td>
+</tr>
+<tr class="even">
+<td><code>STATE_SENDING_CMD</code></td>
+<td><code>EVENT_CMD_COMPLETE</code></td>
+<td><code>dw_mci_command_complete()</code>，清
+<code>host-&gt;cmd</code></td>
+<td>无 data 或命令错误则 <code>request_end</code>；有 data 且成功则
+<code>STATE_SENDING_DATA</code></td>
+</tr>
+<tr class="odd">
+<td><code>STATE_SENDING_DATA</code></td>
+<td><code>EVENT_XFER_COMPLETE</code></td>
+<td>标记 transfer complete</td>
+<td>无 late data error 则 <code>STATE_DATA_BUSY</code></td>
+</tr>
+<tr class="even">
+<td><code>STATE_DATA_BUSY</code></td>
+<td><code>EVENT_DATA_COMPLETE</code></td>
+<td><code>dw_mci_data_complete()</code>，清
+<code>host-&gt;data</code></td>
+<td>不需要 stop 则 <code>request_end</code>；需要 stop 则发 stop 并进
+<code>STATE_SENDING_STOP</code></td>
+</tr>
+<tr class="odd">
+<td><code>STATE_SENDING_STOP</code></td>
+<td><code>EVENT_CMD_COMPLETE</code></td>
+<td>完成 stop 命令，必要时 reset</td>
+<td><code>request_end</code></td>
+</tr>
+</tbody>
+</table>
+<p>正常读/写路径对应代码：命令完成分支从
+<code>kernel/drivers/mmc/host/dw_mmc.c:2195</code> 开始，data transfer
+分支从 <code>kernel/drivers/mmc/host/dw_mmc.c:2252</code> 开始，data
+busy 分支从 <code>kernel/drivers/mmc/host/dw_mmc.c:2319</code>
+开始，stop 分支从 <code>kernel/drivers/mmc/host/dw_mmc.c:2386</code>
+开始。</p>
+<h2 id="6-状态转移表命令阶段分支">6. 状态转移表：命令阶段分支</h2>
+<table>
+<thead>
+<tr class="header">
+<th>条件</th>
+<th style="text-align: right;">代码位置</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>没有 <code>EVENT_CMD_COMPLETE</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2197</code></td>
+<td>停在 <code>SENDING_CMD/SENDING_CMD11</code></td>
+</tr>
+<tr class="even">
+<td>当前命令是 <code>mrq-&gt;sbc</code> 且成功</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2204</code></td>
+<td>立即启动真正的 <code>mrq-&gt;cmd</code>，不结束 request</td>
+</tr>
+<tr class="odd">
+<td>命令带 data 且出错，非 timeout，方向是读</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2210</code></td>
+<td>进入
+<code>STATE_SENDING_DATA</code>，让可能已经开始的数据读完，避免竞态</td>
+</tr>
+<tr class="even">
+<td>命令带 data 且出错，其他情况</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2238</code></td>
+<td>发送 stop/abort，停止 DMA，进入 <code>STATE_SENDING_STOP</code></td>
+</tr>
+<tr class="odd">
+<td>命令无 data 或命令出错无需继续 data</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2244</code></td>
+<td><code>dw_mci_request_end()</code></td>
+</tr>
+<tr class="even">
+<td>命令带 data 且成功</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2249</code></td>
+<td>进入 <code>STATE_SENDING_DATA</code></td>
+</tr>
+</tbody>
+</table>
+<p>最反直觉的是“读方向 response CRC error 仍然进入 data
+state”。源码注释解释得很直白：控制器可能已经进入数据传输状态，强行 stop
+反而容易制造竞态，所以让数据路径自然收尾再处理。</p>
+<h2 id="7-状态转移表数据阶段分支">7. 状态转移表：数据阶段分支</h2>
+<p><code>STATE_SENDING_DATA</code> 等的是
+<code>EVENT_XFER_COMPLETE</code>，但会优先检查
+<code>EVENT_DATA_ERROR</code>：</p>
+<table>
+<thead>
+<tr class="header">
+<th>条件</th>
+<th style="text-align: right;">代码位置</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>先看到 <code>EVENT_DATA_ERROR</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2261</code></td>
+<td>需要时发 stop/abort，停止 DMA，进 <code>STATE_DATA_ERROR</code></td>
+</tr>
+<tr class="even">
+<td>写方向数据错误</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2268</code></td>
+<td>直接设置
+<code>bytes_xfered = 0</code>、<code>data-&gt;error = -ETIMEDOUT</code>，结束
+request</td>
+</tr>
+<tr class="odd">
+<td>没有 <code>EVENT_XFER_COMPLETE</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2278</code></td>
+<td>根据方向启动 DTO/xfer timer，继续等</td>
+</tr>
+<tr class="even">
+<td>有 <code>EVENT_XFER_COMPLETE</code> 后又发现 late data error</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2306</code></td>
+<td>发 stop/abort，停止 DMA，进 <code>STATE_DATA_ERROR</code></td>
+</tr>
+<tr class="odd">
+<td>transfer complete 且无 data error</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2315</code></td>
+<td>进入 <code>STATE_DATA_BUSY</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>STATE_DATA_ERROR</code> 很小：它只等
+<code>EVENT_XFER_COMPLETE</code>，等到了就转
+<code>STATE_DATA_BUSY</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:2406</code>。这说明 data error
+后仍要让 transfer complete 和 data complete
+两侧尽量对齐，避免漏收尾。</p>
+<h2 id="8-状态转移表data-busy-与-stop">8. 状态转移表：data busy 与
+stop</h2>
+<p><code>STATE_DATA_BUSY</code> 等
+<code>EVENT_DATA_COMPLETE</code>，然后调用
+<code>dw_mci_data_complete()</code> 判断最终 data status。</p>
+<table>
+<thead>
+<tr class="header">
+<th>条件</th>
+<th style="text-align: right;">代码位置</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>没有 <code>EVENT_DATA_COMPLETE</code></td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2320</code></td>
+<td>按需启动 DTO/xfer timer，继续等</td>
+</tr>
+<tr class="even">
+<td>data 成功，且无 stop 或已有 sbc</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2338</code></td>
+<td><code>request_end</code></td>
+</tr>
+<tr class="odd">
+<td>data 成功，且需要 stop</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2347</code></td>
+<td>发送 stop/abort，进入 <code>STATE_SENDING_STOP</code></td>
+</tr>
+<tr class="even">
+<td>data 失败，且没有 pending command complete</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2370</code></td>
+<td>清 <code>host-&gt;cmd</code>，直接 <code>request_end</code></td>
+</tr>
+<tr class="odd">
+<td>data 失败，但已经有 stop/cmd complete</td>
+<td
+style="text-align: right;"><code>kernel/drivers/mmc/host/dw_mmc.c:2382</code></td>
+<td>进入 <code>STATE_SENDING_STOP</code> 继续完成 stop 收尾</td>
+</tr>
+</tbody>
+</table>
+<p><code>STATE_SENDING_STOP</code> 等
+<code>EVENT_CMD_COMPLETE</code>。如果原始 data command
+已经有命令错误，会 reset 控制器，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:2390</code>。然后完成 stop 命令并
+<code>request_end()</code>。</p>
+<h2 id="9-cmd11-特殊路径">9. CMD11 特殊路径</h2>
+<p>CMD11 是 SD 3.0 voltage switch。它不只是普通命令，因为 CMD11
+完成后还要配合电压/clock 切换。路径如下：</p>
+<p><img src="assets/cmd11_lane.svg" alt="CMD11 特殊路径" /></p>
+<p>关键点：</p>
+<ol type="1">
+<li><code>dw_mci_prepare_command()</code> 发现 opcode 是
+<code>SD_SWITCH_VOLTAGE</code>，设置
+<code>SDMMC_CMD_VOLT_SWITCH</code>，并把状态从
+<code>STATE_SENDING_CMD</code> 改成 <code>STATE_SENDING_CMD11</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:301</code>。</li>
+<li><code>__dw_mci_start_request()</code> 给 CMD11 启动一个更长的
+<code>cmd11_timer</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1407</code>。</li>
+<li>CMD11 完成后走普通 <code>EVENT_CMD_COMPLETE</code> 分支，最终
+<code>dw_mci_request_end()</code> 发现当前状态是
+<code>STATE_SENDING_CMD11</code>，把状态设为
+<code>STATE_WAITING_CMD11_DONE</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1992</code>。</li>
+<li>后续 <code>dw_mci_setup_bus()</code> 在
+<code>STATE_WAITING_CMD11_DONE</code> 时继续带
+<code>SDMMC_CMD_VOLT_SWITCH</code> 更新 clock，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1258</code>。</li>
+<li><code>dw_mci_set_ios()</code> 在 clock 非 0 时把状态恢复到
+<code>STATE_IDLE</code>，见
+<code>kernel/drivers/mmc/host/dw_mmc.c:1620</code>。</li>
+</ol>
+<p>所以 CMD11 不是 tasklet 单独能解释完的状态，它跨了 request、state
+machine、clock setup、set_ios 四个位置。</p>
+<h2 id="10-读状态机的最短口诀">10. 读状态机的最短口诀</h2>
+<p>先看当前状态，再看它等哪个事件；事件没到就停，事件到了才看错误码。命令错看
+<code>cmd_status</code>，数据错看
+<code>data_status</code>，数据路径一定区分 <code>XFER_COMPLETE</code> 和
+<code>DATA_COMPLETE</code>，CMD11 一定跨到 <code>set_ios()</code>
+才算真正收尾。</p>
+
+        <div class="footer">Generated as a static GitHub Pages site from the Markdown source in this repository.</div>
+      </article>
+    </main>
+  </div>
+</body>
+</html>

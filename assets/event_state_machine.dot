@@ -1,0 +1,46 @@
+digraph G {
+  graph [rankdir=TB, bgcolor="white", pad="0.25", nodesep="0.55", ranksep="0.60", splines=ortho];
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=14, margin="0.16,0.10", color="#cbd5e1", fillcolor="#f8fafc"];
+  edge [fontname="Arial", fontsize=12, color="#475569", arrowsize=0.8];
+
+  subgraph cluster_prod {
+    label="1. event producers"; style="rounded,filled"; fillcolor="#f8fafc"; color="#cbd5e1"; fontsize=17;
+    rank=same;
+    irq [label="IRQ\nCMD_DONE / DATA_OVER / ERROR", fillcolor="#fee2e2", color="#fca5a5"];
+    dma [label="DMA callback\nXFER_COMPLETE", fillcolor="#dbeafe", color="#93c5fd"];
+    pio [label="PIO RXDR/TXDR\nXFER_COMPLETE", fillcolor="#ffedd5", color="#fdba74"];
+    timer [label="timers\nCMD/DATA timeout -> same events", fillcolor="#fef9c3", color="#fde047"];
+  }
+
+  mailbox [label="2. pending_events mailbox\nCMD_COMPLETE | XFER_COMPLETE | DATA_COMPLETE | DATA_ERROR\nstatus is stored first: cmd_status / data_status / bytes_xfered", fillcolor="#f1f5f9", color="#94a3b8"];
+  tasklet [label="3. tasklet consumes events\ndw_mci_tasklet_func(): switch(host->state), then loop while state changes", fillcolor="#ede9fe", color="#c4b5fd"];
+
+  subgraph cluster_normal {
+    label="4. normal request lane"; style="rounded,filled"; fillcolor="#f0fdf4"; color="#bbf7d0"; fontsize=17;
+    cmd [label="SENDING_CMD / SENDING_CMD11\nwait: CMD_COMPLETE\nthen: command_complete()", fillcolor="#dbeafe", color="#93c5fd"];
+    data [label="SENDING_DATA\nwait: XFER_COMPLETE\nmeaning: memory/DMA/PIO side done", fillcolor="#dcfce7", color="#86efac"];
+    busy [label="DATA_BUSY\nwait: DATA_COMPLETE\nmeaning: controller/card data over", fillcolor="#bbf7d0", color="#4ade80"];
+    stop [label="SENDING_STOP (optional)\nwait: CMD_COMPLETE\nmeaning: stop/abort done", fillcolor="#ede9fe", color="#c4b5fd"];
+    end [label="request_end()\nqueue next request or return IDLE", fillcolor="#e2e8f0", color="#94a3b8"];
+  }
+
+  subgraph cluster_ex {
+    label="5. exception rules are read as table, not arrows"; style="rounded,filled"; fillcolor="#fff1f2"; color="#fecdd3"; fontsize=17;
+    e1 [label="command error with data\nread + non-timeout may still let data finish\nother cases send stop/abort", fillcolor="#fee2e2", color="#fca5a5"];
+    e2 [label="DATA_ERROR\nstop DMA, maybe send stop/abort\nDATA_ERROR state waits XFER_COMPLETE", fillcolor="#ffe4e6", color="#fb7185"];
+    e3 [label="CMD11\nSENDING_CMD11 -> WAITING_CMD11_DONE\nset_ios(clock != 0) -> IDLE", fillcolor="#fef9c3", color="#fde047"];
+  }
+
+  irq -> mailbox;
+  dma -> mailbox;
+  pio -> mailbox;
+  timer -> mailbox;
+  mailbox -> tasklet;
+  tasklet -> cmd;
+  cmd -> data [label="data cmd ok"];
+  data -> busy [label="XFER_COMPLETE"];
+  busy -> stop [label="needs stop"];
+  stop -> end;
+  busy -> end [label="no stop / sbc"];
+  cmd -> end [label="no data", constraint=false];
+}

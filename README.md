@@ -16,7 +16,7 @@
 | [03. 数据路径：DMA、PIO 与 FIFO](03_data_path_dma_pio.md) | 为什么有的请求走 DMA，有的回退 PIO，数据完成到底指什么 | `kernel/drivers/mmc/host/dw_mmc.c:1128`, `kernel/drivers/mmc/host/dw_mmc.c:1187`, `kernel/drivers/mmc/host/dw_mmc.c:2810` |
 | [04. IRQ/timer/tasklet 状态机](04_interrupts_timers_tasklet.md) | 状态机每个状态等什么事件、消费后去哪、错误路径如何收尾 | `kernel/drivers/mmc/host/dw_mmc.c:2171`, `kernel/drivers/mmc/host/dw_mmc.c:2943`, `kernel/drivers/mmc/host/dw_mmc.c:3326` |
 | [05. 时钟、电源、CMD11 与 SDIO IRQ](05_power_clock_voltage_sdio_pm.md) | `set_ios()`、`setup_bus()`、电压切换和 SDIO 中断为什么会影响状态机 | `kernel/drivers/mmc/host/dw_mmc.c:1498`, `kernel/drivers/mmc/host/dw_mmc.c:1250`, `kernel/drivers/mmc/host/dw_mmc.c:1638` |
-| [06. 调试与读代码方法](06_reading_and_debugging.md) | 卡住时看哪些 debugfs 节点、状态值如何解码、如何缩小范围 | `kernel/drivers/mmc/host/dw_mmc.c:132`, `kernel/drivers/mmc/host/dw_mmc.c:2037`, `kernel/drivers/mmc/host/dw_mmc.c:1817` |
+| [06. 调试与读代码方法](06_reading_and_debugging.md) | 卡住时看哪些 debugfs 节点、状态值如何解码、如何缩小范围 | `kernel/drivers/mmc/host/dw_mmc.c:132`, `kernel/drivers/mmc/host/dw_mmc.c:2037`, `kernel/drivers/mmc/host/dw_mmc.c:1817` |\n| [07. BCM 蓝牙 deep suspend/resume 故障排查](07_bcm_bluetooth_deep_suspend_resume.md) | 如何从真实 deep 后的首条 HCI 超时，沿 serdev、UART、流控和 BCM 唤醒链路缩小范围 | `drivers/bluetooth/hci_bcm.c`, `drivers/bluetooth/hci_serdev.c`, `drivers/tty/serdev/core.c`, `Documentation/power/basic-pm-debugging.rst` |
 
 ## 读者应该先记住的 6 个事实
 

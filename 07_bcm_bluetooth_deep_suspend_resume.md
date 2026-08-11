@@ -1,57 +1,56 @@
-# 07. Linux BCM 蓝牙 Deep Suspend/Resume 故障排查：从 serdev、UART 到 HCI 首条命令超时
+# 07. Linux BCM 蓝牙 Deep Suspend/Resume 故障排查：从现象到最小可疑范围
 
-> 一篇以证据为中心的内核/硬件协同排障记录：先固定复现契约，再画出跨层链路，最后用实验把范围压缩到最小可疑区间。
+> 本文记录一次 Linux 目标板上 Broadcom BCM 蓝牙在真正 `deep` 休眠约 50 秒后唤醒异常的排查过程。
 >
-> 本文是“范围定位”而不是“根因定案”。为适合公开发布，设备内网地址和本地绝对路径已脱敏；源码行号来自当时使用的 Linux 6.12 目标树，换版本后应优先以函数名和调用关系为准。
+> 文章只报告当前证据能支持的范围，不把“可能性降低”写成“已经排除”，也不把“分层模型”误写成“已经知道具体哪一层坏了”。设备内网地址和本地绝对路径已脱敏；源码行号来自 Linux 6.12 目标树，换版本后应优先以函数名和调用关系为准。
 
 ## TL;DR
 
-**现象**：蓝牙正常工作时进入真正的 `deep`，休眠约 50 秒后唤醒，BCM 控制器唤醒后的首条 HCI 命令不完成，出现 `-110`/hardware error，`hci0` 不能回到 `UP RUNNING`。
-
-**当前最小可疑范围**：
+### 已经定位到哪里
 
 ```text
-真实 deep 低功耗入口/返回
-        ↓
-UART 控制器 / serdev 恢复、FIFO、时钟、RTS/CTS
-        ↓
-hci_bcm 唤醒时序与 HOST_WAKE
-        ↓
-BCM 返回唤醒后的首条 HCI 命令响应
+用户态 / BlueZ
+        ↓ 已基本排除
+HCI 基础运行路径
+        ↓ 已基本排除
+pm_test=core 覆盖的基础 PM 流程
+        ↓ 已通过
+真实 deep 低功耗返回后的链路
+        ↓ 当前最小可疑范围
+UART/serdev/硬件流控
+    + BT_WAKE/HOST_WAKE
+    + BCM 唤醒后的首条 HCI 命令响应
 ```
 
-**当前最重要的证据**：
+### 当前最强证据
 
-- `pm_test=core` 通过，但真实 `deep` 仍失败；
-- UART `power/control=auto` 和 `on` 两种策略下，50 秒休眠 × 5 次均失败；
-- VBAT、32 kHz、BT_REG_ON 正常，只能排除粗粒度掉电/复位；
-- `bcm_resume_device()` 的固定等待从 15 ms 改成 1 秒，50 秒休眠 × 5 次仍失败；
-- 停止 BlueZ 后，内核 HCI/serdev 链路仍可复现。
+- 正常启动后蓝牙工作正常，真正 `deep` 休眠约 50 秒后唤醒，首条 HCI 命令超时；
+- `pm_test=core` 通过，但不能模拟真实 deep 的平台固件/低功耗入口；
+- UART `power/control=auto` 和 `on` 都在 50 秒休眠 × 5 次中失败；
+- VBAT、32 kHz、BT_REG_ON 正常，只能降低粗粒度掉电/复位的可能性；
+- 将 `bcm_resume_device()` 的 15 ms 等待改为 1 秒后仍然失败；
+- 停止 BlueZ 后，内核 HCI/serdev 路径仍可复现。
 
-**当前不能声称**：已经定位到某一个具体寄存器、某一根 UART 线或某一个硬件器件。下一刀应优先做 `s2idle` 与 `deep` 对比，并为首条 HCI 命令建立 TX/RX 时间线。
+### 仍然没有定位到哪一个具体点
 
-## 0. 阅读这篇文章需要先知道的事
+当前还不能仅凭日志判断是下面哪一项：
 
-本文把结论分成三类：
+1. 首条 HCI 命令没有从 UART 发出；
+2. 命令发出，但 BCM 没有被唤醒或没有响应；
+3. BCM 已响应，但 UART RX、HOST_WAKE、IRQ、serdev 或 H4 parser 没有把响应交给 HCI。
 
-| 标签 | 含义 |
-|---|---|
-| **已观察** | 设备或日志直接显示的事实 |
-| **可支持推断** | 多个事实共同支持，但还不是根因证明 |
-| **未验证** | 仍需软件 trace、寄存器或示波器确认 |
+这三个分支，才是下一步真正要区分的对象。
 
-这一区分很重要。比如“电源正常”是已观察事实；“电源不是问题”就超出了证据，因为 UART 的独立时钟、电源域、FIFO、IO retention 和 BCM 内部状态仍可能异常。
+## 1. 先定义问题：什么算一次有效失败
 
-## 1. 事件定义：什么算失败
+### 1.1 现象
 
-### 1.1 复现现象
-
-目标板在正常启动后蓝牙可以工作。执行真正的 `deep` 休眠，保持约 50 秒，再唤醒，典型失败链路如下：
+目标板正常启动后，蓝牙可以工作。进入真正的 `deep`，保持约 50 秒，再唤醒，典型失败链路是：
 
 ```text
 系统本身恢复
     ↓
-蓝牙内核设备仍然可见
+蓝牙内核设备仍可见
     ↓
 BCM 唤醒后的首条 HCI 命令没有完成
     ↓
@@ -62,17 +61,17 @@ HCI command timeout，例如 -110
 hci0 不能恢复为 UP RUNNING
 ```
 
-“蓝牙异常”不应只用 `bluetoothd` 是否退出判断。每次实验的成功判据应至少包括：
+因此“蓝牙异常”不能只看 `bluetoothd` 是否运行。每次测试至少要检查：
 
-- `hci0` 在休眠前为 `UP RUNNING`；
-- 唤醒后 `hci0` 仍为 `UP RUNNING`；
-- 没有首条 HCI command timeout；
-- 没有 hardware error；
-- 必要时可完成一次最小 HCI 查询。
+- 休眠前 `hci0` 是 `UP RUNNING`；
+- 唤醒后 `hci0` 是否仍为 `UP RUNNING`；
+- 是否出现首条 HCI command timeout；
+- 是否出现 hardware error；
+- 必要时是否能完成最小 HCI 查询。
 
-### 1.2 最小测试环境
+### 1.2 最小复现环境
 
-复现不需要扫描、配对、音频连接或业务应用。最小环境只保留：
+当前问题不需要扫描、配对、音频连接或具体蓝牙业务。最小环境是：
 
 ```text
 Linux system PM
@@ -80,79 +79,85 @@ Linux system PM
   + hci_uart/hci_bcm
   + BCM 控制器
   + 真实 deep 休眠/唤醒
-  + 唤醒后 HCI 状态检查
+  + 唤醒后的 HCI 状态检查
 ```
 
-`bluetoothd`、BlueZ 管理接口和业务应用可以帮助描述用户体验，但不是当前故障链路的必要条件。
+`bluetoothd`、BlueZ 管理接口和业务应用可以描述用户态表现，但不是当前故障的必要前置条件。
 
-## 2. 复现契约：先把实验做成可比较的数据
+## 2. 证据链：每个实验到底排除了什么
 
-近期工程故障复盘通常先定义影响、成功判据、基线和样本纪律，再讨论假设。本案例最终采用的有效基线是：
+下面先按“观察 → 允许的结论 → 尚不能推出什么”推理，不先讲假设。
 
-| 项目 | 固定条件 |
-|---|---|
-| 低功耗模式 | 真正的 `deep`，不能用 `pm_test` 代替 |
-| 单次休眠时长 | 约 50 秒 |
-| 每批样本 | 5 次 |
-| 起始状态 | 每次确认 `hci0` 为 `UP RUNNING` |
-| 失败处理 | 先完整恢复蓝牙，再开始下一次 |
-| 成功判据 | 唤醒后 `hci0` 为 `UP RUNNING` 且无 HCI 超时 |
-| 无效条件 | 上一次失败后没有完成恢复，或没有确认起始状态 |
+| 观察/实验 | 允许的结论 | 仍不能推出 |
+|---|---|---|
+| 正常启动后蓝牙可用 | 初始枚举、固件加载和普通运行路径基本可用 | deep resume 路径正常 |
+| 停止 BlueZ 后仍可复现 | 用户态业务不是必要条件 | 所有用户态问题都不存在 |
+| `pm_test=core` 通过 | 基础 PM 回调和浅层恢复没有直接卡死 | 真实 deep 的平台、retention、UART 硬件状态正常 |
+| `power/control=auto`，50 秒 × 5 均失败 | 不是单纯 runtime PM auto 策略造成 | system PM 不影响 UART |
+| `power/control=on`，50 秒 × 5 均失败 | 强制 runtime active 仍不能解决 | UART 在 deep 中保持全功耗、寄存器/FIFO 保持 |
+| VBAT/32 kHz/BT_REG_ON 正常 | 粗粒度主电源、低频时钟和 BT_REG_ON 未见消失 | UART 独立时钟/电源域、IO retention、数据线正常 |
+| 15 ms 改成 1 秒，50 秒 × 5 仍失败 | 单纯延长固定等待不是解决方案 | 恢复顺序、流控和 BCM 内部状态正常 |
+| 首条 HCI 命令超时 | 故障发生在唤醒后的控制器通信闭环 | TX、BCM 响应、RX 三者中的具体断点 |
 
-最初曾观察到约 18 秒即可触发异常，但这个时长没有形成稳定基线。后续固定为 50 秒，以减少“休眠时间不足”和“样本状态不一致”带来的干扰。
-
-早期“连续 2 次 deep 通过”的结论已经撤回：两次只能说明两个样本通过，不能称为稳定。
-
-另一次“20 秒休眠 10 次”批次也不能计算成功率：脚本在失败后只重新执行了部分用户态启动动作，没有确认 `hci0` 回到 `UP RUNNING`，也没有为每次失败做完整驱动恢复，导致后续样本被前一次异常污染。
-
-## 3. 证据矩阵：观察到什么，能推出什么
-
-| 实验/观察 | 结果 | 可以支持的结论 | 不能推出的结论 |
-|---|---|---|---|
-| `pm_test=core` | 通过，蓝牙正常 | 基础 PM 回调链没有直接卡死 | 不能证明真实 deep 的平台/硬件保持状态正常 |
-| UART `power/control=auto` | 50 秒 × 5，均失败 | 不是简单的 runtime PM auto 策略问题 | 不能证明 system PM 没有影响 UART |
-| UART `power/control=on` | 50 秒 × 5，均失败 | 强制 runtime active 仍不能解决 | 不能证明 UART 时钟/FIFO/pinmux 在 deep 中保持 |
-| VBAT / 32 kHz / BT_REG_ON | 正常 | 粗粒度电源、低频时钟、BT_REG_ON 复位路径未见消失 | 不能证明 UART 独立域和 IO retention 正常 |
-| resume 延时 15 ms → 1 秒 | 50 秒 × 5，仍失败 | 单纯增大固定等待不是解决方案 | 不能排除恢复顺序或握手状态问题 |
-| 停止 BlueZ | 内核 HCI/serdev 路径仍可复现 | 用户态业务不是必要条件 | 不能证明所有用户态问题都不存在 |
-| 正常启动后蓝牙可用 | 通过 | 初始枚举和普通运行路径基本可用 | 不能证明 deep resume 路径可用 |
-
-### 3.1 `auto` 和 `on` 到底表示什么
+### 2.1 `power/control=auto` 与 `on` 的含义
 
 ```text
 power/control=auto
-    = 允许 runtime PM 根据空闲状态自动挂起/恢复
+    = 允许 runtime PM 根据空闲状态挂起/恢复
 
 power/control=on
     = 禁止该设备进入 runtime suspend，保持 runtime active
 ```
 
-这两个值只描述 runtime PM 策略，不等于系统 suspend 时 UART 一定保持全功耗。执行 `echo mem > /sys/power/state` 时，system PM 仍会执行自己的 suspend/resume 回调，平台也仍可能切换时钟、电源域和 IO retention。
+这两个值只控制 runtime PM 策略。它们不等于系统 suspend 时 UART 一定保持全功耗，因为 `echo mem > /sys/power/state` 仍会执行 system PM 的 suspend/resume，平台也仍可能切换时钟、电源域和 IO retention。
 
-因此“`power/control=on` 仍失败”不能推出“驱动已排除”；它只能排除“单纯 runtime autosuspend 策略导致失败”。
+所以 `auto`、`on` 都失败，只能排除“单纯 runtime autosuspend 策略”这一解释，不能排除 UART 关联驱动。
 
-### 3.2 为什么 `pm_test=core` 不能排除关联驱动
+### 2.2 为什么 `pm_test=core` 通过仍不能排除驱动
 
-Linux 内核文档把 `pm_test` 定义为分阶段测试工具。对于 suspend-to-RAM，`core` 可以测试核心设备/处理器/系统设备路径，但**不等于真正调用平台固件进入 sleep state**。可参见 [Linux suspend 调试文档](https://www.kernel.org/doc/html/latest/power/basic-pm-debugging.html) 和 [系统 suspend code flow](https://cdn.kernel.org/doc/html/latest/admin-guide/pm/suspend-flows.html)。
+Linux 的 `pm_test` 是分阶段调试工具。对于 suspend-to-RAM，`core` 可以测试核心的设备、处理器和系统设备路径，但**不等价于真正调用平台固件进入 sleep state**。参见 Linux 的 [suspend 调试文档](https://www.kernel.org/doc/html/latest/power/basic-pm-debugging.html) 和 [系统 suspend code flow](https://cdn.kernel.org/doc/html/latest/admin-guide/pm/suspend-flows.html)。
 
-所以 `pm_test=core` 通过只说明：
+因此：
 
-- 基础设备回调没有立即挂死；
-- 浅层 suspend/resume 时 UART/serdev/HCI 可以工作；
-- 失败依赖真实 deep 或真实硬件状态的可能性上升。
+```text
+pm_test=core 通过
+    = 基础 PM 回调和浅层恢复可运行
 
-它不能排除：
+真实 deep 失败
+    = 真实平台/SoC 低功耗动作或硬件保持状态仍有问题可能
+```
 
-- 驱动在真实硬件低功耗状态下保存/恢复不完整；
-- UART 父设备与 hci_bcm 的恢复顺序问题；
-- 驱动回调成功返回，但 GPIO/时钟/FIFO 实际状态错误；
-- 驱动只在真实 deep 后收到一个不同的硬件状态。
+驱动仍可能在真实 deep 后出问题，例如：
 
-## 4. Linux 休眠的阶段与命令分类
+- UART 驱动在真实硬件状态变化后恢复不完整；
+- UART 父设备与 serdev/hci_bcm 恢复顺序不对；
+- 回调返回成功，但 GPIO、时钟、FIFO 或 pinmux 实际状态错误；
+- 只有真实 deep 才会触发 BCM 与主机之间的唤醒状态不一致。
 
-### 4.1 系统 suspend 的阶段
+### 2.3 实验纪律不是定位层级，但决定数据是否有效
 
-Linux system suspend 至少应按下面的边界理解：
+有效基线是：
+
+| 项目 | 条件 |
+|---|---|
+| 低功耗模式 | 真正 `deep` |
+| 休眠时间 | 约 50 秒 |
+| 每批样本 | 5 次 |
+| 每次起始状态 | `hci0` 为 `UP RUNNING` |
+| 失败后 | 先完整恢复蓝牙，再开始下一次 |
+| 成功判据 | 唤醒后 `hci0` 为 `UP RUNNING`，无 HCI timeout |
+
+早期“连续 2 次 deep 通过”的结论已经撤回：两个样本不能证明稳定。
+
+“20 秒休眠 10 次”批次也不能计算成功率，因为失败后只做了部分用户态启动动作，没有确认 `hci0` 恢复，也没有做完整驱动恢复，后续样本被前一次异常污染。
+
+最初观察到约 18 秒即可触发异常，但这个时长没有形成稳定基线；后续统一采用 50 秒。
+
+## 3. 休眠阶段和命令分类
+
+### 3.1 system suspend 的逻辑阶段
+
+Linux system suspend 应拆成：
 
 ```mermaid
 flowchart TD
@@ -167,9 +172,9 @@ flowchart TD
     I --> J[用户态服务恢复]
 ```
 
-设备 PM 通常会经过 prepare、suspend、late suspend、noirq 等阶段；真正的 `deep` 还会触发平台和 SoC 的低功耗动作。相关阶段定义可参考 Linux 的 [CPU and Device Power Management](https://www.kernel.org/doc/html/latest/driver-api/pm/index.html)。
+设备通常会经过 prepare、suspend、late suspend、noirq 等 PM 阶段；真正的 `deep` 还会执行平台和 SoC 的低功耗动作。阶段定义可参考 [CPU and Device Power Management](https://www.kernel.org/doc/html/latest/driver-api/pm/index.html)。
 
-### 4.2 命令按作用分类
+### 3.2 命令按作用分类
 
 **选择内存睡眠实现：**
 
@@ -179,8 +184,8 @@ echo s2idle > /sys/power/mem_sleep
 echo deep > /sys/power/mem_sleep
 ```
 
-- `s2idle)：suspend-to-idle，通常不进入最深的平台电源状态；
-- `deep`：平台定义的深度内存睡眠，通常更接近 suspend-to-RAM。
+- `s2idle`：suspend-to-idle，通常不进入最深的平台电源状态；
+- `deep`：平台定义的深度内存睡眠。
 
 **触发 system suspend：**
 
@@ -190,8 +195,6 @@ systemctl suspend
 rtcwake -m mem -s 50
 ```
 
-它们可能进入同一类 system suspend，但唤醒来源和控制方式不同。
-
 **触发 hibernation：**
 
 ```sh
@@ -199,9 +202,9 @@ echo disk > /sys/power/state
 systemctl hibernate
 ```
 
-hibernation 通过 `/sys/power/disk` 选择 `platform`、`shutdown`、`reboot` 等模式，和本案例的 `mem/deep` 不是同一条测试路径。
+hibernation 通过 `/sys/power/disk` 选择 `platform`、`shutdown`、`reboot` 等模式，与本案例的 `mem/deep` 不是同一条路径。
 
-**只测试 PM 子阶段：**
+**PM 分阶段调试：**
 
 ```sh
 echo freezer   > /sys/power/pm_test
@@ -212,11 +215,11 @@ echo core      > /sys/power/pm_test
 echo none      > /sys/power/pm_test
 ```
 
-`pm_test` 是调试开关，不应被当作真正的 deep 休眠替代品。每次实验完成后都要恢复 `none`。
+在本案例中，`core` 已经通过。因此在同一内核、同一脚本、同一硬件条件下，继续把 `freezer/devices/platform/processors` 全部重复一遍，不会带来新的定位信息；除非测试条件发生变化，或需要验证某个新改动没有破坏基础 PM。
 
-## 5. 完整链路：serdev、UART、HCI 谁在谁的上面
+## 4. 完整链路：serdev、UART、HCI 的顺序
 
-### 5.1 发送方向
+### 4.1 发送方向
 
 ```mermaid
 flowchart LR
@@ -224,12 +227,12 @@ flowchart LR
     C --> H[hci_uart]
     H --> S[hci_serdev]
     S --> SC[serdev core]
-    SC --> D[SoC UART controller driver]
-    D --> P[TX + RTS/CTS pins]
+    SC --> D[SoC UART controller]
+    D --> P[TX + RTS/CTS]
     P --> B[BCM controller]
 ```
 
-### 5.2 接收方向
+### 4.2 接收方向
 
 ```text
 BCM controller
@@ -242,26 +245,26 @@ serdev receive callback
       ↓
 hci_serdev
       ↓
-hci_uart H4 packet parser
+hci_uart H4 parser
       ↓
 Bluetooth HCI core
       ↓
 用户态
 ```
 
-几个层次不要混为一谈：
+层次含义：
 
-- `serdev` 是串行设备总线框架，不是 HCI 协议；
-- `hci_serdev` 把 HCI UART 客户端接到 serdev；
-- `hci_uart` 负责 H4 等 UART HCI 传输；
-- `hci_bcm` 负责 Broadcom 控制器协议和 PM 适配；
-- SoC UART 驱动负责时钟、FIFO、DMA、pinmux、硬件流控和真实引脚。
+- `serdev`：串行设备总线框架；
+- `hci_serdev`：把 HCI UART 客户端接到 serdev；
+- `hci_uart`：H4 等 UART HCI 传输；
+- `hci_bcm`：Broadcom 控制器协议和 PM 适配；
+- SoC UART 驱动：时钟、FIFO、DMA、pinmux、硬件流控和物理引脚。
 
-“蓝牙驱动节点还在”不能证明 UART 能收发；“UART resume 回调返回 0”也不能证明 BCM 已经能处理首条 HCI 命令。
+这张图完成的是**静态分层**。它告诉我们有哪些层，但不告诉我们这一次唤醒实际断在哪个事件上。
 
-## 6. DTS 事实与信号角色
+## 5. DTS 和信号事实
 
-目标设备树的关键连接关系可以抽象为：
+目标设备树的关键关系可以抽象为：
 
 ```dts
 &uart9 {
@@ -273,72 +276,48 @@ Bluetooth HCI core
 };
 ```
 
-| 信号 | 方向 | 角色 |
+| 信号 | 方向 | 作用 |
 |---|---|---|
-| BT_WAKE / device-wakeup | 主机 → BCM | 主机请求 BCM 唤醒或保持活动 |
+| BT_WAKE / device-wakeup | 主机 → BCM | 请求 BCM 唤醒或保持活动 |
 | HOST_WAKE / host-wakeup | BCM → 主机 | BCM 请求主机唤醒或表示有数据 |
-| BT_REG_ON / shutdown | 主机 → BCM | 电源/复位使能路径，通常不是每次普通 resume 都翻转 |
-| TX/RX | 双向数据 | HCI H4 字节流 |
-| RTS/CTS | 双向流控 | 防止发送方超过接收方处理能力 |
+| BT_REG_ON / shutdown | 主机 → BCM | 电源/复位使能路径 |
+| TX/RX | 双向 | HCI H4 字节流 |
+| RTS/CTS | 双向 | UART 硬件流控 |
 
-DTS 只能说明连接关系和配置意图。要证明 deep 期间信号正确，还需要结合 pinctrl、IO retention、UART 寄存器和实际波形。具体高低电平必须以 GPIO polarity、UART 控制器定义和原理图为准，不能从信号名直接猜。
+DTS 只能说明连接关系和配置意图，不能单独证明：
 
-## 7. suspend/resume 的代码和时序
+- deep 期间电平保持；
+- IO retention 正常；
+- pinmux 恢复；
+- UART 时钟/FIFO 正常；
+- UART 线上有正确波形。
 
-以下函数名来自目标 Linux 6.12 树；公开源码可对照 [hci_bcm.c](https://github.com/torvalds/linux/blob/v6.12/drivers/bluetooth/hci_bcm.c)、[hci_ldisc.c](https://github.com/torvalds/linux/blob/v6.12/drivers/bluetooth/hci_ldisc.c)、[hci_serdev.c](https://github.com/torvalds/linux/blob/v6.12/drivers/bluetooth/hci_serdev.c)、[serdev/core.c](https://github.com/torvalds/linux/blob/v6.12/drivers/tty/serdev/core.c) 和 [hci.h](https://github.com/torvalds/linux/blob/v6.12/include/net/bluetooth/hci.h)。
+具体高低电平还必须以 GPIO polarity、UART 控制器定义和原理图为准。
 
-### 7.1 suspend
+## 6. suspend/resume 的代码链路
 
-```mermaid
-sequenceDiagram
-    participant PM as PM core
-    participant BCM as hci_bcm
-    participant SER as serdev/UART
-    participant CHIP as BCM controller
-    PM->>BCM: bcm_suspend()
-    BCM->>BCM: hci_uart_set_flow_control(hu, true)
-    BCM->>BCM: is_suspended = true
-    BCM->>CHIP: BT_WAKE -> inactive
-    BCM->>BCM: wait 15 ms
-    PM->>SER: UART/serdev suspend
-    PM->>PM: enter real deep
-```
+以下函数可对照公开的 [hci_bcm.c](https://github.com/torvalds/linux/blob/v6.12/drivers/bluetooth/hci_bcm.c)、[hci_ldisc.c](https://github.com/torvalds/linux/blob/v6.12/drivers/bluetooth/hci_ldisc.c)、[hci_serdev.c](https://github.com/torvalds/linux/blob/v6.12/drivers/bluetooth/hci_serdev.c)、[serdev/core.c](https://github.com/torvalds/linux/blob/v6.12/drivers/tty/serdev/core.c) 和 [hci.h](https://github.com/torvalds/linux/blob/v6.12/include/net/bluetooth/hci.h)。
 
-目标树中的关键逻辑可以概括为：
+### 6.1 suspend
 
 ```text
-bcm_suspend()
-  → bcm_suspend_device()
-      → hci_uart_set_flow_control(hu, true)
-      → 设置 is_suspended
-      → set_device_wakeup(false)
-      → msleep(15)
+PM core
+  → bcm_suspend()
+      → bcm_suspend_device()
+          → hci_uart_set_flow_control(hu, true)
+          → 设置 is_suspended
+          → set_device_wakeup(false)
+          → msleep(15)
   → UART/平台继续进入 deep
 ```
 
-`bcm_suspend_device()` 没有返回状态，PM 回调成功也不能证明 BT_WAKE、RTS/CTS 和 UART 实际状态已经正确。
+关键事实：
 
-### 7.2 resume
+- `bcm_suspend_device()` 没有返回状态；
+- PM 回调返回成功不等于 BT_WAKE、RTS/CTS、UART FIFO 和控制器状态都正确；
+- GPIO、flow-control 和物理波形需要单独观测。
 
-```mermaid
-sequenceDiagram
-    participant PM as PM/平台
-    participant SER as UART/serdev
-    participant BCM as hci_bcm
-    participant HCI as HCI core
-    participant CHIP as BCM controller
-    PM->>SER: parent UART resume
-    SER->>BCM: hci_bcm resume
-    BCM->>CHIP: BT_WAKE -> active
-    BCM->>BCM: wait 15 ms
-    BCM->>SER: restore flow-control / RTS
-    HCI->>SER: first HCI command
-    SER->>CHIP: UART TX
-    CHIP-->>SER: HCI event / RX
-    SER-->>HCI: parsed command complete
-```
-
-代码路径可简化为：
+### 6.2 resume
 
 ```text
 平台/CPU 从 deep 返回
@@ -354,44 +333,11 @@ sequenceDiagram
   → hci_serdev 接收 → hci_uart/H4 解析
 ```
 
-把 `bcm_resume_device()` 的等待从 15 ms 改为 1 秒后，相同的 50 秒 deep × 5 仍然失败，日志仍出现 `hardware error 0x00` 和 HCI command timeout。因此目前不支持“只需要更长固定等待”的解释。
+目标树中把 resume 固定等待从 15 ms 改为 1 秒后，50 秒 deep × 5 仍然失败。因此当前不支持“只是等待时间太短”的解释。
 
-### 7.3 flow-control 的落点
+### 6.3 BT_WAKE、HOST_WAKE、RTS/CTS 的逻辑时序
 
-在 serdev 路径中，`hci_uart_set_flow_control()` 会进入类似：
-
-```text
-serdev_device_set_flow_control(...)
-serdev_device_set_rts(...)
-```
-
-传统 tty 路径则可能操作 CRTSCTS 和 RTS。逻辑值、电气极性、pinctrl 状态和引脚方向要由 UART 控制器、serdev、DTS 和原理图共同确认。
-
-### 7.4 HCI 超时的含义
-
-唤醒后超时的命令可能是 `HCI_OP_SET_EVENT_MASK`（`0x0c01`）或其他恢复命令。HCI 层看到 `-ETIMEDOUT`，只表示规定时间内没有收到匹配的 command complete/event，无法单独区分：
-
-```text
-主机没有发出 TX
-    或
-UART 发出但 BCM 没收到
-    或
-BCM 没被 BT_WAKE 唤醒
-    或
-BCM 收到但没有返回
-    或
-BCM 返回但 RX/CTS/HOST_WAKE 丢失
-    或
-字节到达但 H4 parser 没组成完整 event
-```
-
-因此“首条 HCI 命令超时”必须继续拆成 TX 证据和 RX event 证据。
-
-## 8. 三根唤醒/流控信号的预期时序
-
-以下是逻辑顺序，不直接规定高低电平。
-
-### 8.1 suspend 前
+**进入 suspend：**
 
 ```text
 停止新的 HCI TX，等待 UART 空闲
@@ -400,14 +346,12 @@ BCM 返回但 RX/CTS/HOST_WAKE 丢失
         ↓
 BT_WAKE 进入非唤醒状态
         ↓
-等待控制器完成过渡（代码为 15 ms）
+等待控制器过渡（代码为 15 ms）
         ↓
 进入真实 deep
 ```
 
-HOST_WAKE 是 BCM 到主机的输入/中断方向，通常被配置为系统唤醒源；它不是由 `bcm_resume_device()` 像 BT_WAKE 那样直接拉动。
-
-### 8.2 resume 后
+**从 deep 返回：**
 
 ```text
 先恢复 UART 电源、时钟、reset、pinmux、FIFO
@@ -416,204 +360,164 @@ BT_WAKE 请求 BCM 唤醒
         ↓
 等待控制器稳定（代码为 15 ms）
         ↓
-恢复 RTS/CTS 与 UART flow-control
+恢复 RTS/CTS 与 flow-control
         ↓
 发送首条 HCI 命令
         ↓
 BCM 返回 command complete 或 hardware event
 ```
 
-如果 UART 在恢复 flow-control 前还没有可用时钟/FIFO，或者 BT_WAKE 已经有效但 BCM 内部状态未恢复，那么把 15 ms 改成 1 秒仍可能失败。
+HOST_WAKE 是 BCM 到主机的输入/中断方向，通常作为系统唤醒源配置；它不是由 `bcm_resume_device()` 像 BT_WAKE 那样直接拉动。
 
-## 9. 现阶段的排除边界
+## 7. 当前最小范围内的三个动态分支
 
-| 层次 | 判断 | 证据强度 |
-|---|---|---|
-| 蓝牙业务应用 | 基本排除 | 高 |
-| bluetoothd/BlueZ | 基本排除 | 高 |
-| HCI 初始枚举/普通运行收发 | 部分排除 | 中 |
-| runtime PM `auto/on` 策略本身 | 基本排除 | 高 |
-| `pm_test=core` 覆盖的基础回调流程 | 降低可能性 | 中 |
-| VBAT/32 kHz/BT_REG_ON 粗粒度掉电 | 降低可能性 | 中 |
-| 15 ms 固定等待过短 | 降低可能性 | 中 |
-| 真实 deep 的平台状态变化 | 未排除，优先级高 | 高 |
-| UART 恢复、FIFO、时钟、pinmux、retention | 未排除，优先级最高 | 高 |
-| RTS/CTS、BT_WAKE、HOST_WAKE 时序 | 未排除，优先级最高 | 高 |
-| BCM 内部唤醒/固件状态 | 未排除，优先级高 | 中 |
-| HOST_WAKE IRQ 路径 | 未排除 | 中 |
-| 跨层恢复顺序和错误传播 | 未排除 | 中 |
-| 物理 UART TX/RX/RTS/CTS | 未排除 | 高 |
+前面的分层已经完成，下一步不是再画一遍层次，而是判断首条 HCI 命令在哪个动态事件上断掉：
 
-### 9.1 当前概率排序
+### A. 主机没有真正发出首条命令
 
-不是按谁先被提出排序，而是按当前证据独立排序：
+可能原因：
 
-1. **UART/serdev 恢复与硬件流控**：UART 时钟、FIFO、baud、RTS/CTS、DMA、父设备恢复顺序；
-2. **真实 deep 造成的 UART/IO retention、pinmux、reset 或电源域变化**；
-3. **BCM 唤醒握手与控制器内部状态**；
-4. **HOST_WAKE IRQ 路由、唤醒使能、极性和边沿**；
-5. **hci_bcm/serdev/UART 恢复顺序及错误状态反馈不足**；
-6. **板级 UART 物理信号完整性**；
-7. **BlueZ/用户态业务**。
+- hci_bcm resume 与 UART parent resume 顺序不对；
+- flow-control/RTS 尚未恢复；
+- HCI core 没有继续提交命令；
+- UART clock、FIFO 或 pinmux 尚未可用。
 
-第 1～3 项可能是同一个故障的不同表现，不能把它们理解成互斥选项。
+### B. 主机发出了命令，但 BCM 没有响应
 
-## 10. 下一轮排查：用二分法替代猜测
+可能原因：
 
-### 10.1 第一刀：`s2idle` vs `deep`
+- BT_WAKE 时序或电平不符合控制器要求；
+- BCM 内部状态未从 deep 返回；
+- BCM 没有收到完整 TX；
+- RTS/CTS 阻止了通信；
+- HOST_WAKE/控制器唤醒握手失败。
 
-```mermaid
-flowchart TD
-    A[同一恢复脚本] --> B[s2idle × N]
-    B --> C{是否失败?}
-    C -- 否 --> D[deep × N]
-    D --> E{是否失败?}
-    E -- 是 --> F[真实低功耗 / retention / UART resume / 硬件握手]
-    E -- 否 --> G[继续查 deep 触发条件与样本纪律]
-    C -- 是 --> H[普通 system PM / serdev / hci_bcm / flow-control]
-```
+### C. BCM 响应了，但主机没有完成 HCI 事件
 
-`s2idle` 通过而 `deep` 失败，是把范围推向平台低功耗、时钟/复位、retention、UART 恢复和硬件握手的最有价值证据。
+可能原因：
 
-### 10.2 第二刀：PM test 分段
+- RX 线或 CTS 流控异常；
+- UART FIFO/DMA/IRQ 没恢复；
+- HOST_WAKE IRQ 丢失或极性错误；
+- serdev receive callback 没有收到数据；
+- H4 parser 没组成完整 event。
 
-按同一份脚本逐级重复：
+当前日志只有“首条 HCI command timeout”，还不足以在 A/B/C 中选择一个。
 
-```text
-none
-  → freezer
-  → devices
-  → platform
-  → processors
-  → core
-  → 真实 deep
-```
+## 8. 当前概率排序
 
-每一级都记录：
+| 优先级 | 假设 | 为什么排在这里 | 还缺什么证据 |
+|---|---|---|---|
+| 1 | UART/serdev 恢复与硬件流控 | 首条命令失败，auto/on 和固定延时都无效 | TX/RX/RTS/CTS、FIFO、时钟和恢复顺序 |
+| 2 | deep 导致 UART/IO retention、pinmux、reset 或电源域变化 | 只在真实 deep 后失败，core 通过 | s2idle/deep 对照、寄存器、pinctrl/波形 |
+| 3 | BCM 唤醒握手或内部状态 | 电源正常但首条命令无响应 | BT_WAKE/HOST_WAKE 和 BCM 响应证据 |
+| 4 | HOST_WAKE IRQ 路径 | 它决定 BCM 到主机的唤醒通知 | 实际 IRQ、极性、边沿、wakeup 状态 |
+| 5 | hci_bcm/serdev/UART 恢复顺序或错误反馈 | 跨层 callback 成功不代表硬件状态成功 | PM trace 和 callback 时间戳 |
+| 6 | 板级 UART 物理信号 | 没有 UART 测试点，软件无法完全证明 | 逻辑分析仪/示波器 |
+| 7 | BlueZ/用户态 | 已能在用户态之下复现 | 当前没有继续优先分析的理由 |
 
-- suspend 是否完成；
-- resume 是否完成；
-- `hci0` 是否为 `UP RUNNING`；
-- 是否出现首条 HCI timeout；
-- 失败后是否完成完整恢复。
+前 1～3 项可能是同一故障的不同侧面，并不是互斥选项。
 
-若所有 `pm_test` 通过、只有真实 deep 失败，普通软件回调的优先级下降，平台低功耗和硬件保持状态的优先级上升。
+## 9. 真正有价值的下一步，以及每一步的目的
 
-### 10.3 第三刀：沿 HCI 首条命令逐点打标记
+### 9.1 一次受控的 `s2idle`/ `deep` A/B
+
+**目的**：确认故障是否依赖真实 deep，而不是重新做一次分层。
+
+使用同一恢复脚本、同一起始状态和相同样本数：
 
 ```text
-HCI core 生成首条命令
-        ↓
-hci_uart 是否收到发送请求
-        ↓
-hci_serdev 是否调用 write
-        ↓
-UART TX FIFO/寄存器是否变化
-        ↓
-BCM 是否通过 HOST_WAKE/CTS 表示可通信
-        ↓
-UART RX 是否收到字节
-        ↓
-hci_serdev 是否收到 buffer
-        ↓
-H4 parser 是否得到完整 event
-        ↓
-HCI core 是否完成 command
+s2idle × N
+deep   × N
 ```
 
-这样可以把“BCM 没响应”和“BCM 响应但主机没收到”分开。
+结果解释：
 
-### 10.4 第四刀：核对真实唤醒 IRQ
+| 结果 | 意义 |
+|---|---|
+| s2idle 通过，deep 失败 | 强化真实平台低功耗、retention、UART 恢复或硬件握手方向 |
+| s2idle 也失败 | 说明问题可能位于两者共用的 system PM/UART/serdev/hci_bcm 路径 |
+| 两者都通过 | 需要重新检查休眠时长、唤醒源和复现契约 |
 
-不能看到某个 IRQ 计数变化就直接认定它是 HOST_WAKE。需要核对：
+它是一次验证性 A/B，不是把已经完成的静态分层推倒重来。
 
-```sh
-cat /proc/interrupts
-cat /proc/irq/<irq>/wakeup
-cat /sys/kernel/debug/wakeup_sources
-cat /sys/power/pm_wakeup_irq
-```
+### 9.2 建立首条 HCI 命令时间线
 
-目标是确认：
-
-- IRQ 是否对应 DTS 中的 HOST_WAKE；
-- 休眠前是否启用 IRQ wake；
-- 唤醒后是否命中预期 IRQ；
-- 极性和触发边沿是否匹配；
-- 是否有 UART 或其他 IRQ 错误地成为实际唤醒源。
-
-### 10.5 第五刀：软件和逻辑分析仪同时看 UART
-
-软件侧检查：
-
-- baud、termios、CRTSCTS；
-- UART clock/reset；
-- FIFO、RX/TX status、DMA 状态；
-- pinctrl 是否回到 UART9 复用状态；
-- RTS/CTS 当前逻辑值和方向；
-- serdev open/close 和 runtime PM 引用。
-
-如果软件证据不足，应在 UART 引脚上观察 BT_WAKE、HOST_WAKE、TX、RX、RTS、CTS，覆盖四个窗口：
-
-1. 进入 suspend 前；
-2. 真正进入 deep 前；
-3. 从 deep 返回后；
-4. 首条 HCI 命令发送及响应。
-
-当前没有 UART 测试点，因此物理信号问题仍然是开放项。
-
-## 11. 建议加入的调试锚点
-
-### 11.1 PM trace
-
-重点观察：
-
-```text
-power:suspend_resume
-power:device_pm_callback_start
-power:device_pm_callback_end
-```
-
-核心问题是确认下面的真实顺序：
-
-```text
-UART parent resume
-  → serdev resume
-      → hci_bcm resume
-          → 首条 HCI TX
-```
-
-如果 hci_bcm resume 已结束但 UART 尚未恢复，或首条 HCI TX 早于 UART clock/pinmux/FIFO 恢复，可以直接把问题归到恢复顺序。
-
-### 11.2 dynamic debug
-
-只对相关文件启用日志：
-
-- `hci_bcm.c)：suspend/resume、BT_WAKE、HOST_WAKE、延时；
-- `hci_serdev.c)：write、receive buffer、serdev open；
-- `hci_ldisc.c)：flow-control、RTS、serdev/tty 分支；
-- SoC UART 驱动：clock、reset、FIFO、DMA、termios 和 system/runtime PM。
-
-### 11.3 首条命令的时间戳
+**目的**：在当前最小范围内选择 A、B、C 三个动态分支。这是当前最高价值的实验。
 
 至少记录：
 
 ```text
 t0: UART parent resume end
 t1: BT_WAKE active
-t2: fixed delay end
+t2: 固定等待结束
 t3: flow-control / RTS restored
 t4: HCI command write called
-t5: UART TX accepted
-t6: HOST_WAKE asserted
-t7: UART RX callback
-t8: HCI event parsed
-t9: command complete
+t5: serdev write called
+t6: UART TX accepted
+t7: HOST_WAKE asserted / IRQ hit
+t8: UART RX callback
+t9: HCI event parsed
+t10: command complete
 ```
 
-缺少其中任意一个点，下一轮实验仍可能停留在“看起来像超时”的层面。
+判定方式：
 
-## 12. 代码审计地图
+| 缺失点 | 优先指向 |
+|---|---|
+| t4/t5 不存在 | HCI/hci_bcm 恢复顺序或状态机 |
+| t5 有、t6 无 | serdev/UART 驱动、时钟、FIFO、流控 |
+| t6 有、没有 t7/t8 | BCM 唤醒、TX 电气链路、RTS/CTS、HOST_WAKE |
+| 有 RX 波形但没有 t8 | UART IRQ/FIFO/DMA/serdev |
+| t8 有但 t9/t10 无 | H4 parser、HCI 状态机或事件匹配 |
+
+### 9.3 软件无法证明时再测 UART 波形
+
+**目的**：把“软件认为发送/接收”与“引脚上实际发生了什么”分开。
+
+只在时间线仍无法区分时测：
+
+- BT_WAKE；
+- HOST_WAKE；
+- TX；
+- RX；
+- RTS；
+- CTS。
+
+观察四个窗口：
+
+1. suspend 前；
+2. 进入 deep 前；
+3. deep 返回后；
+4. 首条 HCI 命令及其响应。
+
+当前没有 UART 测试点，所以物理信号问题仍不能被排除；如果无法接入测量设备，就必须把它明确标记为“未验证”，不能凭软件日志下结论。
+
+### 9.4 每次失败后恢复正常
+
+**目的**：保证样本独立，不是定位某一层。
+
+失败后如果 `hci0` 仍是 DOWN 或驱动状态已污染，下一次测试就不再是同一实验。正确规则是：
+
+```text
+失败
+  → 记录本次结果
+  → 完整解绑/重绑定或使用已验证恢复流程
+  → 确认 hci0 UP RUNNING
+  → 才开始下一次
+```
+
+## 10. 当前不需要重复做的事情
+
+基于现有证据，下面几项不应再作为优先动作：
+
+- 不需要重复跑一遍 `freezer/devices/platform/processors/core`，因为 `core` 已在相同条件下通过；
+- 不需要继续把固定延时从 1 秒改成更大的数值，1 秒仍失败已经否定了“单纯等待不足”；
+- 不需要优先重新分析 `bluetoothd/BlueZ`，故障已在内核 HCI/serdev 路径出现；
+- 不需要仅凭 VBAT、32 kHz、BT_REG_ON 正常就结束硬件方向；
+- 不需要把没有恢复动作的重复失败计入成功率。
+
+## 11. 源码审计地图
 
 | 目标 | 代码入口 |
 |---|---|
@@ -629,32 +533,36 @@ t9: command complete
 | HCI `0x0c01` 等命令定义 | `include/net/bluetooth/hci.h:1105` 附近 |
 | PM 分阶段调试 | [basic-pm-debugging.rst](https://github.com/torvalds/linux/blob/v6.12/Documentation/power/basic-pm-debugging.rst) |
 
-## 13. 最终结论
+## 12. 最终结论
 
-当前最准确的表述不是“蓝牙服务没有恢复”，也不是“`pm_test=core` 通过所以驱动没问题”，而是：
+当前最准确的结论是：
 
 ```text
-Linux 休眠准备和基础 PM 流程可运行
+用户态和普通 HCI 运行路径基本排除
     ↓
-真实 deep 返回后才出现蓝牙异常
+pm_test=core 基础 PM 流程通过
     ↓
-VBAT、32 kHz、BT_REG_ON 未见粗粒度异常
+真正 deep 返回后出现异常
     ↓
-BCM 唤醒后的首条 HCI 命令没有完成
+粗粒度 VBAT/32 kHz/BT_REG_ON 未见异常
     ↓
-最小可疑范围：
-真实 deep 状态变化
-+ UART/serdev 恢复与硬件流控
-+ BT_WAKE/HOST_WAKE/RTS/CTS 握手
-+ BCM 内部唤醒状态
+BCM 唤醒后的首条 HCI 命令未完成
+    ↓
+当前最小可疑范围：
+UART/serdev/硬件流控
++ BT_WAKE/HOST_WAKE
++ BCM 唤醒后的首条 HCI 响应
 ```
 
-最快的下一步不是继续增大固定延时，而是：
+“静态分层”已经完成；下一步不是继续列更多层，而是用最少的动态观测回答一个问题：
 
-1. 用同一恢复脚本比较 `s2idle` 与 `deep`；
-2. 用 `pm_test` 找到“基础 PM 通过、真实 deep 失败”的边界；
-3. 给首条 HCI 命令建立 TX、HOST_WAKE、RX、HCI event 的时间线；
-4. 软件无法证明时，直接测 UART 五/六根相关信号；
-5. 每次失败后先恢复正常，再开始下一次样本。
+> 首条 HCI 命令究竟断在主机 TX、BCM 响应，还是主机 RX/HCI 解析？
 
-这套方法的价值不只是定位本次 BCM 问题：它把“系统醒了但外设坏了”拆成可验证的 PM、平台、UART、serdev、协议和物理层事件，避免把多个层次的成功误认为整条链路成功。
+因此后续优先级应是：
+
+1. 受控比较 `s2idle` 与 `deep`，确认 deep 依赖性；
+2. 建立首条 HCI 命令的 TX/HOST_WAKE/RX/HCI event 时间线；
+3. 只有软件证据不足时才测 UART 五/六根信号；
+4. 每次失败后恢复正常，保证样本独立。
+
+这比重复做已经完成的 PM 分层更接近真正的定位闭环。

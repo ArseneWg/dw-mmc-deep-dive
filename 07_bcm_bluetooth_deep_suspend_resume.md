@@ -409,7 +409,7 @@ flowchart TD
     D -- 否 --> E[BT_WAKE / CTS / pad retention / BCM wake]
     D -- 是 --> F{主机是否收到完整 HCI event?}
     F -- 否 --> G[RX / IRQ / FIFO / HOST_WAKE / serdev callback]
-    F -- 是 --> H[bcm_recv()/h4_recv_buf() + HCI core 完成命令]
+    F -- 是 --> H["bcm_recv()/h4_recv_buf() + HCI core 完成命令"]
 ~~~
 
 这个分支图解释了为什么只看 `hci0` 最终状态，不能反推出失败位于 TX、控制器还是 RX。
@@ -593,7 +593,7 @@ sequenceDiagram
     participant HCI as HCI core
     participant CHIP as BCM controller
     PM->>SER: UART parent/controller resume complete
-    SER->>BCM: child PM dependency satisfied; hci_bcm resume
+    SER->>BCM: child PM dependency satisfied, hci_bcm resume
     BCM->>CHIP: BT_WAKE -> active
     BCM->>BCM: wait 15 ms
     BCM->>SER: restore flow-control / RTS
@@ -842,7 +842,7 @@ flowchart TD
     B -- 是 --> D{t7：RX 是否收到字节?}
     D -- 否 --> E[BT_WAKE/CTS/pad/BCM 响应]
     D -- 是 --> F{t8：是否组成完整 HCI event?}
-    F -- 否 --> G[RX FIFO/IRQ/serdev/bcm_recv()/h4_recv_buf()]
+    F -- 否 --> G["RX FIFO/IRQ/serdev/bcm_recv()/h4_recv_buf()"]
     F -- 是 --> H[t9：HCI completion]
 ~~~
 

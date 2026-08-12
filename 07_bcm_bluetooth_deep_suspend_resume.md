@@ -64,7 +64,7 @@ BCM HCI controller
          → 平台返回与首条 HCI 命令
 ~~~
 
-已经由实验排除或大幅降低的解释包括：BlueZ/bluetoothd 业务依赖、runtime PM `auto/on` 策略本身、单纯把 BCM resume 固定等待从 15 ms 延长到 1 秒、VBAT/32 kHz/BT_REG_ON 的粗粒度异常。唤醒后软件可见的 UART 寄存器、FIFO、时钟和 pinmux 也没有显示稳定的永久损坏。
+已经由实验排除或大幅降低的解释包括：BlueZ/bluetoothd 业务依赖、UART 节点 runtime PM `auto/on` 选择本身、单纯把 BCM resume 固定等待从 15 ms 延长到 1 秒、VBAT/32 kHz/BT_REG_ON 的粗粒度异常。这里的 `auto/on` 实验不等于排除了 `hci_bcm` 自身的 runtime-PM 回调，也不等于证明真实 deep 时 UART 的时钟、FIFO、pinmux 和 IO retention 一定保持。唤醒后软件可见的 UART 寄存器、FIFO、时钟和 pinmux 也没有显示稳定的永久损坏。
 
 当前测试设备在实验结束后已恢复到原始配置；上面的 DTS 是已验证的修复方案，不表示现场仍保留临时实验镜像。
 
@@ -148,8 +148,8 @@ Linux system PM
 | 实验/观察 | 结果 | 可以支持的结论 | 不能推出的结论 |
 |---|---|---|---|
 | `pm_test=core` | 通过，蓝牙正常 | 基础 PM 回调链没有直接卡死 | 不能证明真实 deep 的平台/硬件保持状态正常 |
-| UART `power/control=auto` | 50 秒 × 5，均失败 | 不是简单的 runtime PM auto 策略问题 | 不能证明 system PM 没有影响 UART |
-| UART `power/control=on` | 50 秒 × 5，均失败 | 强制 runtime active 仍不能解决 | 不能证明 UART 时钟/FIFO/pinmux 在 deep 中保持 |
+| UART 节点 `power/control=auto` | 50 秒 × 5，均失败 | 不是简单的 UART runtime autosuspend 策略问题 | 不能证明 `hci_bcm` runtime PM 或 system PM 没有影响 UART |
+| UART 节点 `power/control=on` | 50 秒 × 5，均失败 | 强制 UART runtime active 仍不能解决 | 不能证明 `hci_bcm` runtime PM 或 deep 中的 UART 时钟/FIFO/pinmux 已保持 |
 | VBAT / 32 kHz / BT_REG_ON | 正常 | 粗粒度电源、低频时钟、BT_REG_ON 复位路径未见消失 | 不能证明 UART 独立域和 IO retention 正常 |
 | resume 延时 15 ms → 1 秒 | 50 秒 × 5，仍失败 | 单纯增大固定等待不是解决方案 | 不能排除恢复顺序或握手状态问题 |
 | 停止 BlueZ | 内核 HCI/serdev 路径仍可复现 | 用户态业务不是必要条件 | 不能证明所有用户态问题都不存在 |
@@ -167,7 +167,7 @@ power/control=on
 
 这两个值只描述 runtime PM 策略，不等于系统 suspend 时 UART 一定保持全功耗。执行 `echo mem > /sys/power/state` 时，system PM 仍会执行自己的 suspend/resume 回调，平台也仍可能切换时钟、电源域和 IO retention。
 
-因此“`power/control=on` 仍失败”不能推出“驱动已排除”；它只能排除“单纯 runtime autosuspend 策略导致失败”。
+因此“UART 的 `power/control=on` 仍失败”不能推出“关联驱动已排除”；它只能降低“UART 节点的 runtime autosuspend 策略单独导致失败”的可能性，不能覆盖 `hci_bcm` 自身的 runtime PM 回调，也不能覆盖 system PM 和真实 deep 的硬件状态。
 
 ### 3.2 为什么 `pm_test=core` 不能排除关联驱动
 
@@ -262,9 +262,10 @@ flowchart TD
 cat /sys/power/mem_sleep
 echo s2idle > /sys/power/mem_sleep
 echo deep > /sys/power/mem_sleep
+grep '\[deep\]' /sys/power/mem_sleep
 ```
 
-- `s2idle)：suspend-to-idle，通常不进入最深的平台电源状态；
+- `s2idle`：suspend-to-idle，通常不进入最深的平台电源状态；
 - `deep`：平台定义的深度内存睡眠，通常更接近 suspend-to-RAM。
 
 **触发 system suspend：**
@@ -275,7 +276,7 @@ systemctl suspend
 rtcwake -m mem -s 50
 ```
 
-它们可能进入同一类 system suspend，但唤醒来源和控制方式不同。
+`rtcwake -m mem` 只表示选择 `mem` system-sleep state；实际采用哪个 suspend variant 取决于当前 `/sys/power/mem_sleep`。因此，脚本必须在每轮前确认输出中包含 `[deep]`，否则不能仅凭 `rtcwake -m mem` 声称测试的是 deep。它们的唤醒来源和控制方式也可能不同。
 
 **触发 hibernation：**
 
@@ -303,15 +304,18 @@ echo none      > /sys/power/pm_test
 
 ### 5.1 发送方向
 
+下面是逻辑数据路径，不是每个方框都对应独立的内核模块，也不是严格串行的调用栈。当前 DT BCM 路径由 `hci_bcm` 注册 `bcm_proto`；`hci_serdev` 主要提供 serdev client 回调，发送工作则由 `hci_uart` 的公共 TX 路径驱动。
+
 ```mermaid
 flowchart LR
     U[bluetoothd / hciconfig / bluetoothctl] --> C[Bluetooth HCI core]
-    C --> H[hci_uart]
-    H --> S[hci_serdev]
-    S --> SC[serdev core]
+    C --> H[hci_uart<br/>HCI send / TX work]
+    H --> SC[serdev core<br/>write path]
     SC --> D[SoC UART controller driver]
     D --> P[TX + RTS/CTS pins]
     P --> B[BCM controller]
+    HB[hci_bcm<br/>bcm_proto + PM + wake GPIO] -. protocol / PM .-> H
+    HS[hci_serdev<br/>receive_buf / write_wakeup] -. serdev callbacks .-> H
 ```
 
 ### 5.2 接收方向
@@ -325,9 +329,13 @@ SoC UART controller
       ↓
 serdev receive callback
       ↓
-hci_serdev
+`hci_serdev.c:hci_uart_receive_buf()`
       ↓
-hci_uart H4 packet parser
+`hu->proto->recv()`
+      ↓
+`hci_bcm.c:bcm_recv()`
+      ↓
+`h4_recv_buf()` / HCI frame reassembly
       ↓
 Bluetooth HCI core
       ↓
@@ -337,28 +345,29 @@ Bluetooth HCI core
 几个层次不要混为一谈：
 
 - `serdev` 是串行设备总线框架，不是 HCI 协议；
-- `hci_serdev` 把 HCI UART 客户端接到 serdev；
-- `hci_uart` 负责 H4 等 UART HCI 传输；
-- `hci_bcm` 负责 Broadcom 控制器协议和 PM 适配；
+- `hci_serdev` 把 HCI UART 的 serdev client 回调接到 `hci_uart`；
+- `hci_uart` 提供 HCI UART 的公共注册、发送 work 和 serdev/tty 适配；
+- 当前 BCM 路径由 `hci_bcm` 的 `bcm_proto` 负责 Broadcom 控制器协议、PM、唤醒 GPIO，以及 `bcm_recv()` 中的 H4 帧重组；
+- `hci_h4.c` 仍提供通用 H4 protocol，但当前 BCM DT 路径不是把通用 `h4p` 作为 `hu->proto`，而是由 `bcm_proto` 调用 `h4_recv_buf()`；
 - SoC UART 驱动负责时钟、FIFO、DMA、pinmux、硬件流控和真实引脚。
 
 “蓝牙驱动节点还在”不能证明 UART 能收发；“UART resume 回调返回 0”也不能证明 BCM 已经能处理首条 HCI 命令。
 
 ### 5.3 模块职责图：谁承载什么状态
 
-`hci_bcm` 不是用户态服务，也不是 UART 控制器本身。它同时参与 BCM 控制器的 serdev 绑定、HCI UART protocol 注册、BT_WAKE/HOST_WAKE 管理以及系统/runtime PM 适配；`hci_serdev` 提供 HCI UART 与 serdev 的 client 回调；UART 驱动才直接负责 FIFO、时钟、IRQ、DMA、termios 和硬件流控。
+`hci_bcm` 不是用户态服务，也不是 UART 控制器本身。它同时参与 BCM 控制器的 serdev 绑定、`bcm_proto` 注册、BT_WAKE/HOST_WAKE 管理以及系统/runtime PM 适配；`hci_uart` 提供公共 HCI-UART 注册和 TX work，`hci_serdev` 提供 serdev client 回调，当前 BCM 路径的 H4 帧重组由 `bcm_recv()` 调用 `h4_recv_buf()` 完成；UART 驱动才直接负责 FIFO、时钟、IRQ、DMA、termios 和硬件流控。
 
 ~~~mermaid
 flowchart LR
     APP[用户态测试或蓝牙服务<br/>可选入口] --> CORE[Bluetooth HCI core]
-    CORE --> HU[hci_uart<br/>H4 transport]
-    HU --> HS[hci_serdev<br/>serdev client callbacks]
-    HS --> SC[serdev core]
+    CORE --> HU[hci_uart<br/>common HCI-UART TX/RX]
+    HU --> SC[serdev core]
     SC --> UART[UART9 / 8250-DW]
     UART --> PAD[TX RX RTS CTS pads]
     PAD <--> BCM[BCM HCI controller]
-    HB[hci_bcm<br/>BCM protocol + PM + wake GPIO] -.-> HU
-    HB -.-> HS
+    HS[hci_serdev<br/>serdev client callbacks] -. callbacks .-> HU
+    HB[hci_bcm<br/>bcm_proto + PM + wake GPIO] -. protocol / PM .-> HU
+    HB -. callbacks .-> HS
     PM[system PM] --> RK[rockchip_pm_config]
     RK --> SMC[SUSPEND_IO_RET_CONFIG]
     SMC --> FW[BL31 / PMU]
@@ -369,22 +378,28 @@ flowchart LR
 
 ~~~mermaid
 sequenceDiagram
-    participant T as 测试命令或 HCI core
-    participant H as hci_uart/H4
-    participant S as hci_serdev/serdev
+    participant T as 测试命令
+    participant C as Bluetooth HCI core
+    participant H as hci_uart common TX
+    participant P as hci_bcm bcm_proto
+    participant S as serdev
     participant U as UART9
-    participant B as BCM
-    T->>H: 生成首条 HCI command
-    H->>S: 封装 H4 command frame
+    participant B as BCM controller
+    T->>C: 生成首条 HCI command
+    C->>H: hdev->send()
+    H->>P: hci_uart_send_frame() / bcm_enqueue()
+    P->>S: H4 command frame queued
     S->>U: serdev write
     U->>B: TX bytes
     B-->>U: HCI event / command complete
     U-->>S: RX FIFO + receive callback
-    S-->>H: H4 parser 输入
-    H-->>T: HCI command complete
+    S-->>H: hci_uart_receive_buf()
+    H-->>P: proto->recv() / bcm_recv()
+    P-->>C: h4_recv_buf() / hci_recv_frame()
+    C-->>T: HCI command complete
 ~~~
 
-所以“命令超时”并不是一个单点错误码。它可能代表 TX 没有被接受、字节没有出 UART、BCM 没收到、BCM 没被唤醒、RX 没进 UART、serdev callback 没上送，或 H4 parser 没组成完整 event。
+所以“命令超时”并不是一个单点错误码。它可能代表 TX 没有被接受、字节没有出 UART、BCM 没收到、BCM 没被唤醒、RX 没进 UART、serdev callback 没上送，或 `bcm_recv()`/`h4_recv_buf()` 没组成完整 event。
 
 ~~~mermaid
 flowchart TD
@@ -394,7 +409,7 @@ flowchart TD
     D -- 否 --> E[BT_WAKE / CTS / pad retention / BCM wake]
     D -- 是 --> F{主机是否收到完整 HCI event?}
     F -- 否 --> G[RX / IRQ / FIFO / HOST_WAKE / serdev callback]
-    F -- 是 --> H[H4 parser + HCI core 完成命令]
+    F -- 是 --> H[`bcm_recv()`/`h4_recv_buf()` + HCI core 完成命令]
 ~~~
 
 这个分支图解释了为什么只看 `hci0` 最终状态，不能反推出失败位于 TX、控制器还是 RX。
@@ -480,17 +495,17 @@ DTS 增加的最小配置是：
 
 ~~~mermaid
 flowchart TD
-    DTS[rockchip,sleep-io-ret-config] --> L[Linux rockchip_pm_config]
+    DTS[rockchip,sleep-io-ret-config] --> L[Linux rockchip_pm_config<br/>probe / 初始化]
     L --> S[SUSPEND_IO_RET_CONFIG SMC]
     S --> F[BL31 / secure firmware / PMU]
-    F --> R[VCCIO3 IO retention / isolation control]
+    F --> R[VCCIO3 retention behavior<br/>具体字段由 firmware / TRM 定义]
     R --> P[UART9 TX RX RTS CTS pads]
     P <--> C[BCM controller]
     V[VCCIO3_1V8 rail] --> P
     REG[regulator-on-in-suspend] -. external rail policy .-> V
 ~~~
 
-Linux 代码能证明属性被读取并通过 `SUSPEND_IO_RET_CONFIG` 下发；它不能单独证明 BL31/PMU 最终使用的物理寄存器字段。那需要芯片 TRM、固件源码或硬件测量。
+Linux 代码能证明属性在 `rockchip_pm_config` 初始化时被读取，并通过 `SUSPEND_IO_RET_CONFIG` SMC 下发；`pm_config_prepare()` 后续主要设置当前 sleep state、mode 和 wakeup 配置，并不会在每次 deep 入口重新下发该 IO-ret 参数。Linux 不能单独证明 BL31/PMU 最终使用的物理寄存器字段或具体 isolation 行为；那需要芯片 TRM、固件源码或硬件测量。
 
 ### 6.3 IO retention 不等于 VCCIO3 供电保持
 
@@ -525,39 +540,48 @@ sequenceDiagram
     participant SER as serdev/UART
     participant CHIP as BCM controller
     PM->>BCM: bcm_suspend()
-    BCM->>BCM: hci_uart_set_flow_control(hu, true)
-    BCM->>BCM: is_suspended = true
-    BCM->>CHIP: BT_WAKE -> inactive
-    BCM->>BCM: wait 15 ms
+    alt pm_runtime_active(dev)
+        BCM->>BCM: bcm_suspend_device() [int]
+        BCM->>BCM: hci_uart_set_flow_control(hu, true)
+        BCM->>BCM: is_suspended = true
+        BCM->>CHIP: set_device_wakeup(false) / BT_WAKE inactive
+        BCM->>BCM: wait 15 ms
+    else runtime inactive
+        BCM->>BCM: skip bcm_suspend_device()
+    end
+    Note over PM,BCM: bcm_suspend() ignores bcm_suspend_device() return and returns 0
     PM->>SER: UART/serdev suspend
     PM->>PM: enter real deep
 ```
+
+这里的图只表示这条设备链路的相对顺序：PM core 在 suspend 时会等待子设备完成后再处理 parent，resume 时会等待 parent 完成后再处理 child；无关设备仍可能异步执行。
 
 目标树中的关键逻辑可以概括为：
 
 ```text
 bcm_suspend()
-  → bcm_suspend_device()
-      → hci_uart_set_flow_control(hu, true)
-      → 设置 is_suspended
-      → set_device_wakeup(false)
-      → msleep(15)
+  → if pm_runtime_active(dev)
+      → bcm_suspend_device()  // int，返回值被 bcm_suspend() 忽略
+          → hci_uart_set_flow_control(hu, true)
+          → 设置 is_suspended
+          → set_device_wakeup(false)
+          → msleep(15)
   → UART/平台继续进入 deep
 ```
 
-`bcm_suspend_device()` 没有返回状态，PM 回调成功也不能证明 BT_WAKE、RTS/CTS 和 UART 实际状态已经正确。
+`bcm_suspend_device()` 本身是 `int` 函数：`set_device_wakeup(false)` 失败时返回 `-EBUSY`，成功时返回 `0`。但 `bcm_suspend()` 只有在 `pm_runtime_active(dev)` 时调用它，并且忽略其返回值，最终固定返回 `0`。因此 PM callback 返回成功，不能证明 BT_WAKE、RTS/CTS、UART、pad 或 BCM 实际状态已经正确。
 
 ### 7.1.1 一个容易误读的返回值细节
 
-目标 Linux 6.12 树中，`bcm_suspend_device()` 的函数类型是 `int`，本身会返回 `0` 或错误码；但系统睡眠包装函数 `bcm_suspend()` 调用它时没有接住并传播这个返回值，最后仍返回 `0`。因此：
+目标 Linux 6.12 树中，`bcm_suspend_device()` 的函数类型是 `int`，本身会返回 `0` 或错误码；但 system-sleep 包装函数 `bcm_suspend()` 没有接住并传播这个返回值，最后仍返回 `0`。`bcm_resume()` 也会保存 `bcm_resume_device()` 的错误，但最终仍返回 `0`；该错误只影响 runtime-PM 状态重新激活的分支。
 
 ~~~text
 PM callback 返回 0
         ≠
-BT_WAKE、UART、pad、FIFO 和 BCM 状态已经被证明正确
+BT_WAKE、UART、pad、FIFO、BCM 状态和唤醒后的 HCI event 已经被证明正确
 ~~~
 
-即便某个版本把该函数写成无返回值，结论也一样：回调执行完成只表示代码路径走过，不能替代对真实 deep 硬件状态和唤醒后 HCI event 的验证。
+所以这里能得出的准确结论是“包装回调没有把底层错误报告给 system PM”，而不是“底层函数没有返回状态”。
 
 ### 7.2 resume
 
@@ -568,8 +592,8 @@ sequenceDiagram
     participant BCM as hci_bcm
     participant HCI as HCI core
     participant CHIP as BCM controller
-    PM->>SER: parent UART resume
-    SER->>BCM: hci_bcm resume
+    PM->>SER: UART parent/controller resume complete
+    SER->>BCM: child PM dependency satisfied; hci_bcm resume
     BCM->>CHIP: BT_WAKE -> active
     BCM->>BCM: wait 15 ms
     BCM->>SER: restore flow-control / RTS
@@ -592,21 +616,24 @@ sequenceDiagram
   → HCI core 发送首条命令
   → serdev write → UART TX
   → BCM 返回 HCI event
-  → hci_serdev 接收 → hci_uart/H4 解析
+  → hci_serdev.c:hci_uart_receive_buf()
+  → hu->proto->recv()
+  → hci_bcm.c:bcm_recv()
+  → h4_recv_buf() / HCI frame reassembly
 ```
 
 把 `bcm_resume_device()` 的等待从 15 ms 改为 1 秒后，相同的 50 秒 deep × 5 仍然失败，日志仍出现 `hardware error 0x00` 和 HCI command timeout。因此目前不支持“只需要更长固定等待”的解释。
 
 ### 7.3 flow-control 的落点
 
-在 serdev 路径中，`hci_uart_set_flow_control()` 会进入类似：
+在 serdev 路径中，`hci_uart_set_flow_control(hu, enable)` 实际把取反后的逻辑值传给 serdev：
 
 ```text
-serdev_device_set_flow_control(...)
-serdev_device_set_rts(...)
+serdev_device_set_flow_control(hu->serdev, !enable)
+serdev_device_set_rts(hu->serdev, !enable)
 ```
 
-传统 tty 路径则可能操作 CRTSCTS 和 RTS。逻辑值、电气极性、pinctrl 状态和引脚方向要由 UART 控制器、serdev、DTS 和原理图共同确认。
+因此当前代码中，suspend 的 `enable=true` 表示向 serdev 传入 `false`，resume 的 `enable=false` 表示向 serdev 传入 `true`。这说的是软件逻辑参数，不等同于示波器上的高低电平；传统 tty 路径则可能操作 CRTSCTS 和 RTS。最终逻辑值、电气极性、pinctrl 状态和引脚方向要由 UART 控制器、serdev、DTS 和原理图共同确认。
 
 ### 7.4 HCI 超时的含义
 
@@ -623,7 +650,7 @@ BCM 收到但没有返回
     或
 BCM 返回但 RX/CTS/HOST_WAKE 丢失
     或
-字节到达但 H4 parser 没组成完整 event
+字节到达但 `bcm_recv()`/`h4_recv_buf()` 没组成完整 event
 ```
 
 因此“首条 HCI 命令超时”必须继续拆成 TX 证据和 RX event 证据。
@@ -646,12 +673,12 @@ BT_WAKE 进入非唤醒状态
 进入真实 deep
 ```
 
-HOST_WAKE 是 BCM 到主机的输入/中断方向，通常被配置为系统唤醒源；它不是由 `bcm_resume_device()` 像 BT_WAKE 那样直接拉动。
+HOST_WAKE 是 BCM 到主机的输入/中断方向；在当前驱动中，只有成功取得 host-wakeup IRQ/GPIO 并完成 IRQ/wakeup 配置后，才会作为设备唤醒路径使用。它不是由 `bcm_resume_device()` 像 BT_WAKE 那样直接拉动。
 
 ### 8.2 resume 后
 
 ```text
-先恢复 UART 电源、时钟、reset、pinmux、FIFO
+UART parent/controller resume 完成；UART 驱动按自身 PM 路径恢复时钟、寄存器/FIFO 等，pinmux/reset 的具体先后需由 trace 确认
         ↓
 BT_WAKE 请求 BCM 唤醒
         ↓
@@ -679,7 +706,7 @@ sequenceDiagram
     H->>B: BT_WAKE 进入非唤醒状态
     B-->>H: HOST_WAKE 由 BCM 控制，通常保持 idle
     Note over H,B: 真实 deep：平台执行 IO retention / 低功耗
-    H->>H: UART、pad、时钟和 FIFO 由平台恢复
+    H->>H: UART 驱动/平台按各自路径恢复时钟、pad 和 FIFO
     H->>B: BT_WAKE 请求 BCM 唤醒
     B-->>H: HOST_WAKE 仅在需要主机处理时有效
     H->>H: 恢复硬件流控
@@ -695,7 +722,7 @@ sequenceDiagram
 | HOST_WAKE 唤醒主机 | GPIO IRQ、wakeup source 或波形 |
 | RTS/CTS 放行 TX | UART 流控寄存器和波形 |
 | 首条 command 发出 | hci_uart/serdev write、UART TX FIFO |
-| event 返回 | UART RX、serdev callback、H4 parser、HCI completion |
+| event 返回 | UART RX、serdev callback、`bcm_recv()`/`h4_recv_buf()`、HCI completion |
 
 本案例没有 UART 测试点，所以只能完成软件侧证据，不能把 TX/RX/RTS/CTS 的 deep 窗口波形写成已证实事实。
 
@@ -740,7 +767,7 @@ sequenceDiagram
 - deep 期间具体是哪一个 UART9 pad 的状态发生变化；
 - 是 mux、方向、输出值、pull/keeper、隔离还是瞬态；
 - `hci_bcm` 的 BT_WAKE/RTS/CTS 与 UART resume 哪个事件先后不符合预期；
-- BCM 是否返回了 event、event 是否到达 UART RX、H4 parser 是否完整接收；
+- BCM 是否返回了 event、event 是否到达 UART RX、`bcm_recv()`/`h4_recv_buf()` 是否完整接收；
 - BL31/PMU 最终把 `RKPM_VCCIO3_RET_EN` 映射到哪些 retention/isolation 位。
 
 这些不会改变当前最小软件修复的成立。
@@ -803,7 +830,7 @@ none / freezer / devices / platform / processors / core
 | t5 | serdev write / TX FIFO 接受 | 主机软件是否交给 UART |
 | t6 | HOST_WAKE 变化 | BCM 是否向主机发出唤醒/数据提示 |
 | t7 | UART RX FIFO / receive callback | 主机是否收到字节 |
-| t8 | H4 parser 得到完整 event | 协议帧是否完整 |
+| t8 | `bcm_recv()`/`h4_recv_buf()` 得到完整 event | 协议帧是否完整 |
 | t9 | HCI command complete | HCI 核心是否完成命令 |
 
 对应的故障分叉是：
@@ -815,7 +842,7 @@ flowchart TD
     B -- 是 --> D{t7：RX 是否收到字节?}
     D -- 否 --> E[BT_WAKE/CTS/pad/BCM 响应]
     D -- 是 --> F{t8：是否组成完整 HCI event?}
-    F -- 否 --> G[RX FIFO/IRQ/serdev/H4 parser]
+    F -- 否 --> G[RX FIFO/IRQ/serdev/`bcm_recv()`/`h4_recv_buf()`]
     F -- 是 --> H[t9：HCI completion]
 ~~~
 
@@ -864,21 +891,21 @@ power:device_pm_callback_end
 核心问题是确认下面的真实顺序：
 
 ```text
-UART parent resume
-  → serdev resume
-      → hci_bcm resume
+UART parent/controller resume 完成
+  → serdev 子设备依赖满足
+      → hci_bcm resume callback
           → 首条 HCI TX
 ```
 
-如果 hci_bcm resume 已结束但 UART 尚未恢复，或首条 HCI TX 早于 UART clock/pinmux/FIFO 恢复，可以直接把问题归到恢复顺序。
+如果 trace 观察到 hci_bcm resume 已结束但 UART parent 尚未恢复，或首条 HCI TX 早于 UART clock/pinmux/FIFO 恢复，说明设备依赖、异步 PM 或驱动恢复顺序需要进一步核对。
 
 ### 11.2 dynamic debug
 
 只对相关文件启用日志：
 
-- `hci_bcm.c)：suspend/resume、BT_WAKE、HOST_WAKE、延时；
-- `hci_serdev.c)：write、receive buffer、serdev open；
-- `hci_ldisc.c)：flow-control、RTS、serdev/tty 分支；
+- `hci_bcm.c`：suspend/resume、BT_WAKE、HOST_WAKE、延时；
+- `hci_serdev.c`：write、receive buffer、serdev open；
+- `hci_ldisc.c`：flow-control、RTS、serdev/tty 分支；
 - SoC UART 驱动：clock、reset、FIFO、DMA、termios 和 system/runtime PM。
 
 ### 11.3 首条命令的时间戳
@@ -911,8 +938,11 @@ t9: command complete
 | system/runtime PM ops | `hci_bcm.c:1503` 附近 |
 | flow-control 的 serdev/tty 分支 | `hci_ldisc.c:316` 附近 |
 | serdev write/receive/register | `hci_serdev.c:249/274/303` 附近 |
+| BCM protocol、receive 和 H4 重组 | `hci_bcm.c:694/1307` 附近 |
 | serdev open 与 runtime PM | `drivers/tty/serdev/core.c:149` 附近 |
 | serdev flow-control | `drivers/tty/serdev/core.c:342` 附近 |
+| Rockchip retention 属性读取/SMC | `drivers/soc/rockchip/rockchip_pm_config.c:645` 附近 |
+| `RKPM_VCCIO3_RET_EN` 定义 | `include/dt-bindings/suspend/rockchip-rk3588.h:61` 附近 |
 | HCI `0x0c01` 等命令定义 | `include/net/bluetooth/hci.h:1105` 附近 |
 | PM 分阶段调试 | [basic-pm-debugging.rst](https://github.com/torvalds/linux/blob/v6.12/Documentation/power/basic-pm-debugging.rst) |
 
@@ -936,7 +966,7 @@ flowchart TD
 
 因此，当前最准确的结论不是“蓝牙服务没有恢复”，也不是“`pm_test=core` 通过所以驱动没问题”，而是：
 
-> Linux 休眠准备和基础 PM 流程正常；真实 deep suspend 漏配 UART9 所属 VCCIO3 IO domain 的 IO retention，导致唤醒后的 BCM UART HCI 通信失败。补上 `RKPM_VCCIO3_RET_EN` 后，在原始 DTS 5/5 失败与修复 5/5 通过的可逆对照中恢复正常。
+> 在当前目标树、板卡和 BL31/resource image 组合中，Linux 休眠准备和基础 PM 流程正常；真实 deep suspend 配置遗漏了 UART9 所属 VCCIO3 IO domain 的 IO retention，导致唤醒后的 BCM UART HCI 通信失败。补上 `RKPM_VCCIO3_RET_EN` 后，在原始 DTS 5/5 失败与修复 5/5 通过的可逆对照中恢复正常。
 
 已经定位到的是平台配置/IO domain retention 层；尚未定位到的是 TX、RX、RTS、CTS 具体哪一个 pad，以及 retention 影响的具体寄存器字段、瞬态波形或 BCM 内部失步点。后者是机制级细化，不影响当前最小软件修复成立。
 

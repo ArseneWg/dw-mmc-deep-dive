@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-**现象**：蓝牙正常工作时进入真正的 \`deep\`，休眠约 50 秒后唤醒，BCM 控制器唤醒后的首条 HCI 命令不完成，出现 \`-110\`/hardware error，\`hci0\` 不能回到 \`UP RUNNING\`。
+**现象**：蓝牙正常工作时进入真正的 `deep`，休眠约 50 秒后唤醒，BCM 控制器唤醒后的首条 HCI 命令不完成，出现 `-110`/hardware error，`hci0` 不能回到 `UP RUNNING`。
 
 **最终定位到的可修复根因边界**：
 
@@ -34,8 +34,8 @@ deep 期间 UART9 相关 pad 状态缺少保持保证
 
 | 配置 | 50 秒 deep 结果 |
 |---|---:|
-| 原始 DTS，无 \`rockchip,sleep-io-ret-config\` | 5/5 失败 |
-| 只增加 \`RKPM_VCCIO3_RET_EN\` | 5/5 通过 |
+| 原始 DTS，无 `rockchip,sleep-io-ret-config` | 5/5 失败 |
+| 只增加 `RKPM_VCCIO3_RET_EN` | 5/5 通过 |
 | 恢复原始 DTS | 5/5 失败 |
 | 再增加 retention，反向复测 | 1/1 通过 |
 
@@ -64,11 +64,9 @@ BCM HCI controller
          → 平台返回与首条 HCI 命令
 ~~~
 
-已经由实验排除或大幅降低的解释包括：BlueZ/bluetoothd 业务依赖、runtime PM \`auto/on\` 策略本身、单纯把 BCM resume 固定等待从 15 ms 延长到 1 秒、VBAT/32 kHz/BT_REG_ON 的粗粒度异常。唤醒后软件可见的 UART 寄存器、FIFO、时钟和 pinmux 也没有显示稳定的永久损坏。
+已经由实验排除或大幅降低的解释包括：BlueZ/bluetoothd 业务依赖、runtime PM `auto/on` 策略本身、单纯把 BCM resume 固定等待从 15 ms 延长到 1 秒、VBAT/32 kHz/BT_REG_ON 的粗粒度异常。唤醒后软件可见的 UART 寄存器、FIFO、时钟和 pinmux 也没有显示稳定的永久损坏。
 
 当前测试设备在实验结束后已恢复到原始配置；上面的 DTS 是已验证的修复方案，不表示现场仍保留临时实验镜像。
-
-## 0. 阅读这篇文章需要先知道的事
 
 ## 0. 阅读这篇文章需要先知道的事
 
@@ -202,8 +200,8 @@ Linux 内核文档把 `pm_test` 定义为分阶段测试工具。对于 suspend-
 
 | 配置 | 50 秒 deep 结果 |
 |---|---:|
-| 原始 DTS，无 \`rockchip,sleep-io-ret-config\` | 5/5 失败 |
-| 只增加 \`RKPM_VCCIO3_RET_EN\` | 5/5 通过 |
+| 原始 DTS，无 `rockchip,sleep-io-ret-config` | 5/5 失败 |
+| 只增加 `RKPM_VCCIO3_RET_EN` | 5/5 通过 |
 | 恢复原始 DTS | 5/5 失败 |
 | 再增加 retention 的反向复测 | 1/1 通过 |
 
@@ -348,7 +346,7 @@ Bluetooth HCI core
 
 ### 5.3 模块职责图：谁承载什么状态
 
-\`hci_bcm\` 不是用户态服务，也不是 UART 控制器本身。它同时参与 BCM 控制器的 serdev 绑定、HCI UART protocol 注册、BT_WAKE/HOST_WAKE 管理以及系统/runtime PM 适配；\`hci_serdev\` 提供 HCI UART 与 serdev 的 client 回调；UART 驱动才直接负责 FIFO、时钟、IRQ、DMA、termios 和硬件流控。
+`hci_bcm` 不是用户态服务，也不是 UART 控制器本身。它同时参与 BCM 控制器的 serdev 绑定、HCI UART protocol 注册、BT_WAKE/HOST_WAKE 管理以及系统/runtime PM 适配；`hci_serdev` 提供 HCI UART 与 serdev 的 client 回调；UART 驱动才直接负责 FIFO、时钟、IRQ、DMA、termios 和硬件流控。
 
 ~~~mermaid
 flowchart LR
@@ -399,7 +397,7 @@ flowchart TD
     F -- 是 --> H[H4 parser + HCI core 完成命令]
 ~~~
 
-这个分支图解释了为什么只看 \`hci0\` 最终状态，不能反推出失败位于 TX、控制器还是 RX。
+这个分支图解释了为什么只看 `hci0` 最终状态，不能反推出失败位于 TX、控制器还是 RX。
 
 ## 6. DTS 事实与信号角色
 
@@ -458,7 +456,7 @@ DTS 只能说明连接关系和配置意图。要证明 deep 期间信号正确�
 | HOST_WAKE | GPIO0_A0 | BCM → AP 唤醒请求/中断 |
 | BT_REG_ON | GPIO0_C6 | AP → BCM 电源/复位使能 |
 
-\`uart9m0_xfer\`、\`uart9m0_ctsn\` 和 \`uart9m0_rtsn\` 位于目标树的 VCCIO3 pinctrl 描述中。原理图中的 \`VCCIO3_1V8\` 是该 IO domain 的供电网络；“供电网络正常”与“deep 期间 pad 状态由 retention 保持”是两个不同命题。
+`uart9m0_xfer`、`uart9m0_ctsn` 和 `uart9m0_rtsn` 位于目标树的 VCCIO3 pinctrl 描述中。原理图中的 `VCCIO3_1V8` 是该 IO domain 的供电网络；“供电网络正常”与“deep 期间 pad 状态由 retention 保持”是两个不同命题。
 
 ### 6.2 retention 属性的代码链路
 
@@ -468,7 +466,7 @@ DTS 只能说明连接关系和配置意图。要证明 deep 期间信号正确�
 #define RKPM_VCCIO3_RET_EN BIT(3)
 ~~~
 
-这里的 \`BIT(3)\` 是软件位掩码，即 \`1 << 3\`，值为 \`0x8\`；它不是寄存器偏移，也不是“VCCIO3 的第 3 个寄存器”。
+这里的 `BIT(3)` 是软件位掩码，即 `1 << 3`，值为 `0x8`；它不是寄存器偏移，也不是“VCCIO3 的第 3 个寄存器”。
 
 DTS 增加的最小配置是：
 
@@ -478,7 +476,7 @@ DTS 增加的最小配置是：
 };
 ~~~
 
-\`rockchip_pm_config.c\` 的链路可以画成：
+`rockchip_pm_config.c` 的链路可以画成：
 
 ~~~mermaid
 flowchart TD
@@ -492,7 +490,7 @@ flowchart TD
     REG[regulator-on-in-suspend] -. external rail policy .-> V
 ~~~
 
-Linux 代码能证明属性被读取并通过 \`SUSPEND_IO_RET_CONFIG\` 下发；它不能单独证明 BL31/PMU 最终使用的物理寄存器字段。那需要芯片 TRM、固件源码或硬件测量。
+Linux 代码能证明属性被读取并通过 `SUSPEND_IO_RET_CONFIG` 下发；它不能单独证明 BL31/PMU 最终使用的物理寄存器字段。那需要芯片 TRM、固件源码或硬件测量。
 
 ### 6.3 IO retention 不等于 VCCIO3 供电保持
 
@@ -512,7 +510,7 @@ VCCIO3 供电保持
 VCCIO3 IO pad 状态保持
 ~~~
 
-把 regulator 保持开启、UART runtime PM 设为 \`on\`，都不能替代 \`RKPM_VCCIO3_RET_EN\`。本案例中 \`power/control=on\` 仍然 5/5 失败，而只增加 retention 后 5/5 通过，正是这两个控制面的区分。
+把 regulator 保持开启、UART runtime PM 设为 `on`，都不能替代 `RKPM_VCCIO3_RET_EN`。本案例中 `power/control=on` 仍然 5/5 失败，而只增加 retention 后 5/5 通过，正是这两个控制面的区分。
 
 ## 7. suspend/resume 的代码和时序
 
@@ -551,7 +549,7 @@ bcm_suspend()
 
 ### 7.1.1 一个容易误读的返回值细节
 
-目标 Linux 6.12 树中，\`bcm_suspend_device()\` 的函数类型是 \`int\`，本身会返回 \`0\` 或错误码；但系统睡眠包装函数 \`bcm_suspend()\` 调用它时没有接住并传播这个返回值，最后仍返回 \`0\`。因此：
+目标 Linux 6.12 树中，`bcm_suspend_device()` 的函数类型是 `int`，本身会返回 `0` 或错误码；但系统睡眠包装函数 `bcm_suspend()` 调用它时没有接住并传播这个返回值，最后仍返回 `0`。因此：
 
 ~~~text
 PM callback 返回 0
@@ -670,7 +668,7 @@ BCM 返回 command complete 或 hardware event
 
 ### 8.3 把逻辑时序和电平时序分开
 
-在当前 DTS 中，\`BT_WAKE\` 和 \`HOST_WAKE\` 配置为 \`GPIO_ACTIVE_HIGH\`；但 RTS/CTS 的信号名带有 \`n\`，其物理有效极性和 UART 控制器的逻辑流控语义不能只靠名字猜。下面只画方向和事件，不把所有电平写成通用规则：
+在当前 DTS 中，`BT_WAKE` 和 `HOST_WAKE` 配置为 `GPIO_ACTIVE_HIGH`；但 RTS/CTS 的信号名带有 `n`，其物理有效极性和 UART 控制器的逻辑流控语义不能只靠名字猜。下面只画方向和事件，不把所有电平写成通用规则：
 
 ~~~mermaid
 sequenceDiagram
@@ -710,8 +708,8 @@ sequenceDiagram
 | 蓝牙业务应用 | 基本排除 | 最小复现不需要扫描、配对、音频或业务 |
 | bluetoothd / BlueZ | 基本排除 | 停止用户态服务后内核 HCI/serdev 仍可复现 |
 | HCI 初始枚举/普通运行 | 部分排除 | 正常启动后可用，普通收发路径存在 |
-| runtime PM \`auto/on\` 策略本身 | 基本排除 | 两种策略均为 50 秒 × 5 失败 |
-| \`pm_test=core\` 覆盖的基础回调 | 降低可能性 | \`pm_test=core\` 通过，但不覆盖真实 deep 硬件状态 |
+| runtime PM `auto/on` 策略本身 | 基本排除 | 两种策略均为 50 秒 × 5 失败 |
+| `pm_test=core` 覆盖的基础回调 | 降低可能性 | `pm_test=core` 通过，但不覆盖真实 deep 硬件状态 |
 | VBAT / 32 kHz / BT_REG_ON 粗粒度异常 | 大幅降低 | 休眠期间静态检查正常 |
 | 15 ms 固定等待不足 | 降低可能性 | 改为 1 秒后仍为 50 秒 × 5 失败 |
 | 唤醒后 UART 永久卡死 | 降低可能性 | 寄存器、FIFO、时钟、pinmux 快照接近健康状态 |
@@ -725,7 +723,7 @@ sequenceDiagram
 
 当前可以提交和复用的准确表述是：
 
-> RK3588 真实 deep suspend 配置遗漏了 UART9 所属 VCCIO3 IO domain 的 IO retention；只补充 \`RKPM_VCCIO3_RET_EN\` 即可恢复 BCM 蓝牙唤醒后的 HCI 通信。
+> RK3588 真实 deep suspend 配置遗漏了 UART9 所属 VCCIO3 IO domain 的 IO retention；只补充 `RKPM_VCCIO3_RET_EN` 即可恢复 BCM 蓝牙唤醒后的 HCI 通信。
 
 这不是把“相关性”写成根因，而是因为满足了三个条件：
 
@@ -741,9 +739,9 @@ sequenceDiagram
 
 - deep 期间具体是哪一个 UART9 pad 的状态发生变化；
 - 是 mux、方向、输出值、pull/keeper、隔离还是瞬态；
-- \`hci_bcm\` 的 BT_WAKE/RTS/CTS 与 UART resume 哪个事件先后不符合预期；
+- `hci_bcm` 的 BT_WAKE/RTS/CTS 与 UART resume 哪个事件先后不符合预期；
 - BCM 是否返回了 event、event 是否到达 UART RX、H4 parser 是否完整接收；
-- BL31/PMU 最终把 \`RKPM_VCCIO3_RET_EN\` 映射到哪些 retention/isolation 位。
+- BL31/PMU 最终把 `RKPM_VCCIO3_RET_EN` 映射到哪些 retention/isolation 位。
 
 这些不会改变当前最小软件修复的成立。
 
@@ -756,7 +754,7 @@ sequenceDiagram
 
 ### 10.1 修复回归：同一脚本比较 s2idle 与 deep
 
-在加 retention 的最终镜像上，使用同一恢复脚本、同一休眠时长、独立样本分别做 \`s2idle\` 和 \`deep\`。它的目的不是重新证明 root cause，而是确认：
+在加 retention 的最终镜像上，使用同一恢复脚本、同一休眠时长、独立样本分别做 `s2idle` 和 `deep`。它的目的不是重新证明 root cause，而是确认：
 
 ~~~text
 修复没有改变普通运行路径
@@ -777,9 +775,9 @@ flowchart TD
     D -- 否 --> F[检查镜像、DTB、BL31、样本恢复和板卡版本]
 ~~~
 
-### 10.2 \`pm_test\`：确认边界，而不是替代 deep
+### 10.2 `pm_test`：确认边界，而不是替代 deep
 
-\`pm_test=core\` 通过的意义是基础 PM 回调链本身没有直接卡死；它不能替代真实 deep，也不能单独排除关联驱动。修复前后的分层可记录为：
+`pm_test=core` 通过的意义是基础 PM 回调链本身没有直接卡死；它不能替代真实 deep，也不能单独排除关联驱动。修复前后的分层可记录为：
 
 ~~~text
 none / freezer / devices / platform / processors / core
@@ -789,7 +787,7 @@ none / freezer / devices / platform / processors / core
 真实 deep / 平台低功耗 / IO retention
 ~~~
 
-修复前的边界是“\`pm_test=core\` 通过、真实 deep 失败”；修复后的边界应变成“真实 deep 也通过”。如果修复后只有某个 \`pm_test\` 失败，才需要回到具体 PM callback。
+修复前的边界是“`pm_test=core` 通过、真实 deep 失败”；修复后的边界应变成“真实 deep 也通过”。如果修复后只有某个 `pm_test` 失败，才需要回到具体 PM callback。
 
 ### 10.3 机制级定位：给首条 HCI command 建立时间线
 
@@ -798,7 +796,7 @@ none / freezer / devices / platform / processors / core
 | 时间点 | 事件 | 用途 |
 |---|---|---|
 | t0 | UART parent resume end | 判断 UART 基础设施何时可用 |
-| t1 | \`hci_bcm\` 拉起 BT_WAKE | 判断 BCM 唤醒请求 |
+| t1 | `hci_bcm` 拉起 BT_WAKE | 判断 BCM 唤醒请求 |
 | t2 | 15 ms/实际等待结束 | 判断固定等待边界 |
 | t3 | 恢复 flow-control/RTS | 判断 UART 放行 |
 | t4 | HCI core 生成 command | 命令是否真正产生 |
@@ -936,9 +934,9 @@ flowchart TD
     J --> K[hci0 恢复正常]
 ~~~
 
-因此，当前最准确的结论不是“蓝牙服务没有恢复”，也不是“\`pm_test=core\` 通过所以驱动没问题”，而是：
+因此，当前最准确的结论不是“蓝牙服务没有恢复”，也不是“`pm_test=core` 通过所以驱动没问题”，而是：
 
-> Linux 休眠准备和基础 PM 流程正常；真实 deep suspend 漏配 UART9 所属 VCCIO3 IO domain 的 IO retention，导致唤醒后的 BCM UART HCI 通信失败。补上 \`RKPM_VCCIO3_RET_EN\` 后，在原始 DTS 5/5 失败与修复 5/5 通过的可逆对照中恢复正常。
+> Linux 休眠准备和基础 PM 流程正常；真实 deep suspend 漏配 UART9 所属 VCCIO3 IO domain 的 IO retention，导致唤醒后的 BCM UART HCI 通信失败。补上 `RKPM_VCCIO3_RET_EN` 后，在原始 DTS 5/5 失败与修复 5/5 通过的可逆对照中恢复正常。
 
 已经定位到的是平台配置/IO domain retention 层；尚未定位到的是 TX、RX、RTS、CTS 具体哪一个 pad，以及 retention 影响的具体寄存器字段、瞬态波形或 BCM 内部失步点。后者是机制级细化，不影响当前最小软件修复成立。
 
